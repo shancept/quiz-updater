@@ -86,21 +86,43 @@ def cmd_export_previews(args: argparse.Namespace) -> dict:
 def cmd_update_rating(args: argparse.Namespace) -> dict:
     doc_name = keynote_mod.resolve_doc_name(args.doc)
     # Число раундов задаёт таблица Keynote на выбранном слайде, а не таблица на Drive.
-    rounds = keynote_mod.read_rating_rounds(doc_name, args.slide)
-    _, teams = download_teams(args.file_id, rounds)
+    table = keynote_mod.read_rating_table(doc_name, args.slide)
+    _, teams = download_teams(args.file_id, table["rounds"])
     teams = teams[: args.max_rows]
+    if not teams:
+        raise BackendError(
+            "EXCEL_BAD_FORMAT",
+            f"В таблице на Drive (лист «{excel_mod.SHEET_NAME}») не найдено ни одной команды: "
+            "данные должны идти со 2-й строки, место и название команды — в колонках A и B.",
+        )
+
+    # Число строк таблицы Keynote подгоняется под число команд: недостающие добавляются,
+    # лишние удаляются (иначе в них остались бы данные прошлой игры).
+    rows = keynote_mod.plan_row_change(table["rows"], len(teams), table["height"], table["font_size"])
+    rows_info = {
+        "keynoteRows": rows["currentRows"],
+        "targetRows": rows["targetRows"],
+        "rowsAdded": rows["added"],
+        "rowsRemoved": rows["removed"],
+        "warnings": rows["warnings"],
+    }
 
     if args.dry_run:
-        return {"dryRun": True, "doc": doc_name, "slide": args.slide, "rounds": rounds, "teams": teams}
+        return {"dryRun": True, "doc": doc_name, "slide": args.slide, "rounds": table["rounds"],
+                "teams": teams, **rows_info}
 
     script = keynote_mod.build_rating_script(teams, args.slide, doc_name)
     message = run_applescript(script)
+    if rows["currentRows"] != rows["targetRows"]:
+        message += f" (строк в таблице: {rows['currentRows']} → {rows['targetRows']})"
     return {
         "dryRun": False,
         "doc": doc_name,
         "slide": args.slide,
+        "rounds": table["rounds"],
         "updated": len(teams),
         "message": message,
+        **rows_info,
     }
 
 

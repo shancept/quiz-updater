@@ -275,16 +275,30 @@ final class AppViewModel: ObservableObject {
             let payload: UpdateRatingPayload = try await bridge.run(args, timeout: 90)
             if dryRun {
                 let rounds = payload.rounds.map { ", раундов: \($0)" } ?? ""
-                setStatus(
-                    "Проверка ок: слайд \(payload.slide)\(rounds), команд к обновлению: \(payload.teams?.count ?? 0)",
-                    isError: false
-                )
+                var text = "Проверка ок: слайд \(payload.slide)\(rounds), команд: \(payload.teams?.count ?? 0)"
+                if let rows = ratingRowsText(payload) { text += "; \(rows)" }
+                setStatus(withWarnings(text, payload.warnings), isError: false)
             } else {
-                setStatus(payload.message ?? "Обновлено", isError: false)
+                setStatus(withWarnings(payload.message ?? "Обновлено", payload.warnings), isError: false)
             }
         } catch {
             reportBackendError(error)
         }
+    }
+
+    /// «строк в таблице Keynote: 10 → 8 (будет удалено 2)»; nil, если бэкенд не прислал число строк.
+    private func ratingRowsText(_ payload: UpdateRatingPayload) -> String? {
+        guard let current = payload.keynoteRows, let target = payload.targetRows else { return nil }
+        if current == target { return "строк в таблице: \(current)" }
+        let change = (payload.rowsAdded ?? 0) > 0
+            ? "будет добавлено \(payload.rowsAdded ?? 0)"
+            : "будет удалено \(payload.rowsRemoved ?? 0)"
+        return "строк в таблице Keynote: \(current) → \(target) (\(change))"
+    }
+
+    private func withWarnings(_ text: String, _ warnings: [String]?) -> String {
+        guard let warnings, !warnings.isEmpty else { return text }
+        return ([text] + warnings.map { "⚠️ \($0)" }).joined(separator: "\n")
     }
 
     // MARK: - Режим "Имена призёров"

@@ -14,7 +14,11 @@ struct RatingModeView: View {
                 }
             }
 
-            Stepper("Команд: \(viewModel.maxRows)", value: $viewModel.maxRows, in: 1...50)
+            Stepper("Команд не больше: \(viewModel.maxRows)", value: $viewModel.maxRows, in: 1...50)
+
+            Text("Строк в таблице Keynote станет столько, сколько команд (не больше этого числа)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Text("Кликните по слайду с таблицей рейтинга слева")
                 .font(.caption)

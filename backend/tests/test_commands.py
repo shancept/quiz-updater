@@ -215,15 +215,21 @@ class ReadSheetTest(CommandTestCase):
         self.assertIn("Результаты", payload["error"])
 
 
+def table_shape(rows: int = 10, columns: int = 11, height: float = 568.0, font_size: float = 22.0) -> dict:
+    """Что бэкенд узнаёт о таблице Keynote на слайде (вместо настоящего Keynote)."""
+    return {"rows": rows, "columns": columns, "height": height, "font_size": font_size, "rounds": columns - 3}
+
+
 class UpdateRatingTest(CommandTestCase):
     def setUp(self):
         super().setUp()
         self.install_key()
         self.share_sheet()
         self.applescript = mock.Mock(return_value="OK")
+        self.table = mock.Mock(return_value=table_shape())
         for target, value in (
             ("resolve_doc_name", mock.Mock(return_value="Квиз")),
-            ("read_rating_rounds", mock.Mock(return_value=8)),
+            ("read_rating_table", self.table),
         ):
             patcher = mock.patch.object(cli.keynote_mod, target, value)
             patcher.start()
@@ -232,8 +238,11 @@ class UpdateRatingTest(CommandTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def dry_run(self, *extra: str) -> tuple:
+        return run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", "--dry-run", *extra)
+
     def test_dry_run_takes_exactly_as_many_rounds_as_keynote_table_has(self):
-        code, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", "--dry-run")
+        code, payload = self.dry_run("--max-rows", "3")
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["dryRun"])
         self.assertEqual(payload["rounds"], 8)
@@ -242,26 +251,65 @@ class UpdateRatingTest(CommandTestCase):
         self.applescript.assert_not_called()
 
     def test_seven_round_table_gets_seven_rounds(self):
-        cli.keynote_mod.read_rating_rounds.return_value = 7
-        _, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", "--dry-run")
+        self.table.return_value = table_shape(columns=10)
+        _, payload = self.dry_run()
         self.assertEqual(payload["rounds"], 7)
         self.assertEqual(payload["teams"][0]["rounds"], [10, 20, 30, 40, 50, 60, 70])
 
-    def test_real_run_writes_eight_rounds_to_keynote(self):
+    def test_dry_run_reports_rows_to_remove_when_keynote_table_is_longer(self):
+        self.table.return_value = table_shape(rows=10)  # на Drive две команды
+        _, payload = self.dry_run()
+        self.assertEqual(
+            (payload["keynoteRows"], payload["targetRows"], payload["rowsAdded"], payload["rowsRemoved"]),
+            (10, 2, 0, 8),
+        )
+        self.assertEqual(payload["warnings"], [])
+
+    def test_dry_run_reports_rows_to_add_when_keynote_table_is_shorter(self):
+        self.table.return_value = table_shape(rows=1)
+        _, payload = self.dry_run()
+        self.assertEqual((payload["rowsAdded"], payload["rowsRemoved"]), (1, 0))
+
+    def test_dry_run_warns_when_added_rows_will_not_fit_the_font(self):
+        self.table.return_value = table_shape(rows=1, height=40.0, font_size=22.0)  # 2 строки по 20 pt при шрифте 22 pt
+        _, payload = self.dry_run()
+        self.assertEqual(len(payload["warnings"]), 1)
+
+    def test_max_rows_limits_teams_and_target_rows(self):
+        _, payload = self.dry_run("--max-rows", "1")
+        self.assertEqual([t["name"] for t in payload["teams"]], ["Альфа"])
+        self.assertEqual((payload["targetRows"], payload["rowsRemoved"]), (1, 9))
+
+    def test_real_run_writes_eight_rounds_and_resizes_the_table(self):
         code, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1")
         self.assertEqual(code, 0, payload)
         script = self.applescript.call_args[0][0]
         self.assertIn("set value of cell 11 of row 1 of t to 80", script)
         self.assertNotIn("cell 12", script)
+        self.assertIn("set row count of t to 2", script)
+        self.assertEqual((payload["keynoteRows"], payload["targetRows"], payload["rowsRemoved"]), (10, 2, 8))
 
-    def test_max_rows_limits_teams(self):
-        _, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", "--max-rows", "1", "--dry-run")
-        self.assertEqual([t["name"] for t in payload["teams"]], ["Альфа"])
+    def test_real_run_message_mentions_row_change(self):
+        _, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1")
+        self.assertIn("10 → 2", payload["message"])
+
+    def test_real_run_message_is_plain_when_row_count_already_matches(self):
+        self.table.return_value = table_shape(rows=2)
+        _, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1")
+        self.assertNotIn("→", payload["message"])
+
+    def test_empty_results_sheet_is_an_error_not_an_empty_table(self):
+        for extra in (["--dry-run"], []):
+            self.share_sheet(content=workbook_bytes([HEADER]))  # ответы фейка отдаются по очереди — задаём заново
+            code, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", *extra)
+            self.assertEqual((code, payload["code"]), (1, "EXCEL_BAD_FORMAT"), extra)
+            self.assertIn("команд", payload["error"])
+        self.applescript.assert_not_called()
 
     def test_keynote_error_is_reported_before_touching_drive_data(self):
         from quiz_backend.errors import BackendError
-        cli.keynote_mod.read_rating_rounds.side_effect = BackendError("TEMPLATE_INVALID", "нет таблицы")
-        code, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", "--dry-run")
+        self.table.side_effect = BackendError("TEMPLATE_INVALID", "нет таблицы")
+        code, payload = self.dry_run()
         self.assertEqual((code, payload["code"]), (1, "TEMPLATE_INVALID"))
 
 

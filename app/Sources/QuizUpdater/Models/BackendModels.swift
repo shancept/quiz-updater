@@ -83,6 +83,13 @@ struct UpdateRatingPayload: Decodable {
     let teams: [Team]?
     let updated: Int?
     let message: String?
+    /// Строк в таблице Keynote сейчас и сколько станет: таблица подгоняется под число команд.
+    let keynoteRows: Int?
+    let targetRows: Int?
+    let rowsAdded: Int?
+    let rowsRemoved: Int?
+    /// Например, «новые строки станут ниже шрифта — текст может не поместиться».
+    let warnings: [String]?
 }
 
 struct NameAssignment: Decodable, Identifiable, Hashable {
