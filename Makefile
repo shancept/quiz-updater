@@ -15,9 +15,15 @@ vendor:
 		echo "ОШИБКА: в backend/vendor есть нативные библиотеки — бандл не будет universal"; exit 1; \
 	fi
 
+# Тесты бэкенда системным Python 3.9 — тем же, на котором он работает в бандле (код не должен
+# использовать синтаксис новее). Сеть и ключ Google не нужны: настоящий urllib ходит на локальный
+# фейк Drive, подпись JWT проверяет openssl. Затем два безопасных прогона подкоманд:
+# drive-status (без сети) и list-documents (только читает Keynote).
 test-backend:
-	PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m quiz_backend list-documents
-	PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m quiz_backend read-excel
+	$(SYS_PYTHON) --version
+	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m unittest discover -s backend/tests -t backend
+	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m quiz_backend drive-status
+	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m quiz_backend list-documents
 
 build:
 	swift build --package-path app -c release --arch arm64 --arch x86_64 --product QuizUpdater
