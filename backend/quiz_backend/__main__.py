@@ -2,19 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 
+from . import drive as drive_mod
 from . import excel as excel_mod
 from . import keynote as keynote_mod
 from . import schedule as schedule_mod
 from .applescript import run_applescript
 from .errors import BackendError
 
-DEFAULT_EXCEL = os.path.expanduser(
-    "~/Library/CloudStorage/GoogleDrive-shancept@gmail.com/"
-    "My Drive/КВИЗ/Копия Копия Калькулятор баллов Классика.xlsx"
-)
 DEFAULT_SLIDE = 81
 DEFAULT_MAX_ROWS = 10
 DEFAULT_COMPRESSION = 0.5
@@ -46,9 +42,39 @@ def cmd_list_documents(args: argparse.Namespace) -> dict:
     return {"keynoteRunning": running, "documents": documents}
 
 
-def cmd_read_excel(args: argparse.Namespace) -> dict:
-    teams = excel_mod.read_teams(args.path)
-    return {"teams": teams}
+def download_teams(file_id: str, rounds: int) -> tuple:
+    """Скачивает таблицу с Drive заново (без кэша) и читает команды → (метаданные файла, команды)."""
+    meta, data = drive_mod.installed_client().download_xlsx(file_id)
+    return meta, excel_mod.read_teams(data, rounds)
+
+
+def cmd_drive_status(args: argparse.Namespace) -> dict:
+    # Без сети: только читает адрес робота из ключа на диске.
+    if not drive_mod.is_connected():
+        return {"connected": False, "clientEmail": None}
+    return {"connected": True, "clientEmail": drive_mod.load_installed_key().client_email}
+
+
+def cmd_connect_drive(args: argparse.Namespace) -> dict:
+    key = drive_mod.read_key_file(args.key)
+    sheets = drive_mod.client_for(key).list_sheets()  # токен + запрос = проверка, что ключ рабочий
+    drive_mod.install_key(args.key)  # только после успешной проверки: рабочий ключ не затирается
+    return {"clientEmail": key.client_email, "sheetCount": len(sheets)}
+
+
+def cmd_list_sheets(args: argparse.Namespace) -> dict:
+    client = drive_mod.installed_client()
+    return {"clientEmail": client.client_email, "sheets": client.list_sheets()}
+
+
+def cmd_resolve_link(args: argparse.Namespace) -> dict:
+    file_id = drive_mod.parse_drive_link(args.link)
+    return {"sheet": drive_mod.installed_client().get_sheet(file_id)}
+
+
+def cmd_read_sheet(args: argparse.Namespace) -> dict:
+    meta, teams = download_teams(args.file_id, args.rounds)
+    return {"sheetName": meta["name"], "teams": teams}
 
 
 def cmd_export_previews(args: argparse.Namespace) -> dict:
@@ -59,11 +85,13 @@ def cmd_export_previews(args: argparse.Namespace) -> dict:
 
 def cmd_update_rating(args: argparse.Namespace) -> dict:
     doc_name = keynote_mod.resolve_doc_name(args.doc)
-    teams = excel_mod.read_teams(args.excel)
+    # Число раундов задаёт таблица Keynote на выбранном слайде, а не таблица на Drive.
+    rounds = keynote_mod.read_rating_rounds(doc_name, args.slide)
+    _, teams = download_teams(args.file_id, rounds)
     teams = teams[: args.max_rows]
 
     if args.dry_run:
-        return {"dryRun": True, "doc": doc_name, "slide": args.slide, "teams": teams}
+        return {"dryRun": True, "doc": doc_name, "slide": args.slide, "rounds": rounds, "teams": teams}
 
     script = keynote_mod.build_rating_script(teams, args.slide, doc_name)
     message = run_applescript(script)
@@ -78,7 +106,7 @@ def cmd_update_rating(args: argparse.Namespace) -> dict:
 
 def cmd_replace_names(args: argparse.Namespace) -> dict:
     doc_name = keynote_mod.resolve_doc_name(args.doc)
-    teams = excel_mod.read_teams(args.excel)
+    _, teams = download_teams(args.file_id, rounds=0)
     by_place = excel_mod.teams_by_place(teams)
     pairs = parse_pairs(args.pairs)
 
@@ -174,9 +202,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = subparsers.add_parser("list-documents")
     p_list.set_defaults(handler=cmd_list_documents)
 
-    p_read = subparsers.add_parser("read-excel")
-    p_read.add_argument("--path", type=str, default=DEFAULT_EXCEL)
-    p_read.set_defaults(handler=cmd_read_excel)
+    p_status = subparsers.add_parser("drive-status")
+    p_status.set_defaults(handler=cmd_drive_status)
+
+    p_connect = subparsers.add_parser("connect-drive")
+    p_connect.add_argument("--key", type=str, required=True, help="путь к JSON-ключу сервисного аккаунта")
+    p_connect.set_defaults(handler=cmd_connect_drive)
+
+    p_sheets = subparsers.add_parser("list-sheets")
+    p_sheets.set_defaults(handler=cmd_list_sheets)
+
+    p_link = subparsers.add_parser("resolve-link")
+    p_link.add_argument("--link", type=str, required=True, help="ссылка на таблицу в Google Drive / Sheets")
+    p_link.set_defaults(handler=cmd_resolve_link)
+
+    p_read = subparsers.add_parser("read-sheet")
+    p_read.add_argument("--file-id", type=str, required=True, dest="file_id")
+    p_read.add_argument("--rounds", type=int, default=0, help="сколько колонок раундов (с D) прочитать")
+    p_read.set_defaults(handler=cmd_read_sheet)
 
     p_export = subparsers.add_parser("export-previews")
     p_export.add_argument("--doc", type=str, default=None)
@@ -187,14 +230,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_rating = subparsers.add_parser("update-rating")
     p_rating.add_argument("--doc", type=str, default=None)
     p_rating.add_argument("--slide", type=int, default=DEFAULT_SLIDE)
-    p_rating.add_argument("--excel", type=str, default=DEFAULT_EXCEL)
+    p_rating.add_argument("--file-id", type=str, required=True, dest="file_id")
     p_rating.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS, dest="max_rows")
     p_rating.add_argument("--dry-run", action="store_true", dest="dry_run")
     p_rating.set_defaults(handler=cmd_update_rating)
 
     p_names = subparsers.add_parser("replace-names")
     p_names.add_argument("--doc", type=str, default=None)
-    p_names.add_argument("--excel", type=str, default=DEFAULT_EXCEL)
+    p_names.add_argument("--file-id", type=str, required=True, dest="file_id")
     p_names.add_argument("--pairs", type=str, required=True, help="место:слайд,место:слайд, например 1:182,2:181")
     p_names.add_argument("--dry-run", action="store_true", dest="dry_run")
     p_names.set_defaults(handler=cmd_replace_names)
@@ -221,7 +264,7 @@ def main() -> int:
         print(json.dumps({"ok": True, **payload}, ensure_ascii=False))
         return 0
     except BackendError as exc:
-        print(json.dumps({"ok": False, "code": exc.code, "error": exc.message}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "code": exc.code, "error": exc.message, **exc.details}, ensure_ascii=False))
         return 1
     except Exception as exc:  # noqa: BLE001 - всегда возвращаем валидный JSON наверх
         print(json.dumps({"ok": False, "code": "UNKNOWN_ERROR", "error": str(exc)}, ensure_ascii=False))

@@ -8,7 +8,9 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import os
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -33,6 +35,10 @@ REQUEST_TIMEOUT = 10
 # между раундами, поэтому ретраев мало: хватает на кратковременный сбой, не на простой.
 BACKOFF_SECONDS = (1.0, 2.0)
 MAX_LIST_PAGES = 20
+
+DEFAULT_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/QuizUpdater")
+KEY_FILENAME = "service-account.json"
+SUPPORT_DIR = DEFAULT_SUPPORT_DIR  # модульная переменная, чтобы тесты могли подменить каталог
 
 _RATE_LIMIT_REASONS = ("rateLimitExceeded", "userRateLimitExceeded")
 _NOT_SHARED_REASONS = ("notFound", "forbidden", "insufficientFilePermissions")
@@ -348,19 +354,83 @@ class DriveClient:
             file_scope=True,
         )
 
-    def download_xlsx(self, file_id: str) -> tuple:
-        """Скачивает таблицу заново (без кэша) → (метаданные, байты .xlsx)."""
+    def get_sheet(self, file_id: str) -> dict:
+        """Метаданные файла; EXCEL_BAD_FORMAT, если это не Google-таблица и не .xlsx."""
         meta = self.get_file(file_id)
-        mime = meta.get("mimeType")
-        quoted = quote(file_id, safe="")
-        if mime == SHEETS_MIME:
-            data = self._request(f"/files/{quoted}/export", {"mimeType": XLSX_MIME}, file_scope=True)
-        elif mime == XLSX_MIME:
-            data = self._request(f"/files/{quoted}", {"alt": "media", "supportsAllDrives": "true"}, file_scope=True)
-        else:
+        if meta.get("mimeType") not in (SHEETS_MIME, XLSX_MIME):
             raise BackendError(
                 "EXCEL_BAD_FORMAT",
-                f"«{meta.get('name', file_id)}» — не таблица (тип файла: {mime}). "
+                f"«{meta.get('name', file_id)}» — не таблица (тип файла: {meta.get('mimeType')}). "
                 "Выберите Google-таблицу или файл .xlsx.",
             )
+        return meta
+
+    def download_xlsx(self, file_id: str) -> tuple:
+        """Скачивает таблицу заново (без кэша) → (метаданные, байты .xlsx)."""
+        meta = self.get_sheet(file_id)
+        quoted = quote(file_id, safe="")
+        if meta["mimeType"] == SHEETS_MIME:
+            data = self._request(f"/files/{quoted}/export", {"mimeType": XLSX_MIME}, file_scope=True)
+        else:
+            data = self._request(f"/files/{quoted}", {"alt": "media", "supportsAllDrives": "true"}, file_scope=True)
         return meta, data
+
+
+# --- Ключ на диске: подключение Drive на этом Mac --------------------------------------
+
+
+def key_path() -> str:
+    return os.path.join(SUPPORT_DIR, KEY_FILENAME)
+
+
+def is_connected() -> bool:
+    return os.path.exists(key_path())
+
+
+def read_key_file(path: str) -> ServiceAccountKey:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, ValueError) as exc:
+        raise BackendError("DRIVE_KEY_INVALID", f"Не удалось прочитать файл ключа: {exc}") from exc
+    return ServiceAccountKey.from_json(text)
+
+
+def load_installed_key() -> ServiceAccountKey:
+    if not is_connected():
+        raise BackendError(
+            "DRIVE_NOT_CONNECTED",
+            "Google Drive не подключён. Нажмите «Подключить Google Drive…» и выберите JSON-ключ "
+            "сервисного аккаунта.",
+        )
+    return read_key_file(key_path())
+
+
+def install_key(source_path: str) -> None:
+    """Копирует ключ в каталог приложения (права 0600, каталог 0700), атомарно заменяя прежний."""
+    destination = key_path()
+    try:
+        if os.path.exists(destination) and os.path.samefile(source_path, destination):
+            return
+        os.makedirs(SUPPORT_DIR, exist_ok=True)
+        os.chmod(SUPPORT_DIR, 0o700)
+        fd, tmp_path = tempfile.mkstemp(dir=SUPPORT_DIR, prefix=".key-")  # mkstemp создаёт файл с 0600
+        try:
+            with os.fdopen(fd, "wb") as out, open(source_path, "rb") as src:
+                out.write(src.read())
+            os.replace(tmp_path, destination)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+    except OSError as exc:
+        raise BackendError("DRIVE_ERROR", f"Не удалось сохранить ключ в {SUPPORT_DIR}: {exc}") from exc
+
+
+def client_for(key: ServiceAccountKey) -> DriveClient:
+    # Адреса читаются из модуля в момент вызова (а не при импорте) — тесты подменяют их на фейк.
+    return DriveClient(key, api_base=API_BASE, token_uri=TOKEN_URI)
+
+
+def installed_client() -> DriveClient:
+    return client_for(load_installed_key())

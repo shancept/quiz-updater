@@ -6,9 +6,11 @@ import re
 
 from .applescript import escape_as_string, format_multiline_value, format_value, run_applescript
 from .errors import BackendError
+from .excel import FIXED_COLUMNS
 
 PLACEHOLDER = "ЗАМЕНИТЬ"
 SCHEDULE_SLOT_COUNT = 4
+NO_TABLE_MARKER = "no-table"
 
 
 def is_keynote_running() -> bool:
@@ -109,6 +111,49 @@ return "OK"
 
     files.sort(key=slide_number)
     return [{"slide": i + 1, "path": path} for i, path in enumerate(files)]
+
+
+def build_rating_columns_script(doc_name: str, slide_num: int) -> str:
+    """Read-only AppleScript: число колонок «Таблицы 1» (table 1) на слайде или marker, если таблицы нет."""
+    doc_ref = _doc_ref(doc_name)
+    return f"""
+tell application "Keynote"
+    tell {doc_ref}
+        set s to slide {slide_num}
+        if (count of tables of s) is 0 then return "{NO_TABLE_MARKER}"
+        return (column count of table 1 of s) as string
+    end tell
+end tell
+"""
+
+
+def rounds_from_table_output(output: str, slide_num: int) -> int:
+    """Число раундов = число колонок таблицы минус место, команда, итого (FIXED_COLUMNS)."""
+    text = output.strip()
+    if text == NO_TABLE_MARKER:
+        raise BackendError(
+            "TEMPLATE_INVALID",
+            f"На слайде {slide_num} нет таблицы рейтинга. Выберите слайд с таблицей рейтинга.",
+        )
+    try:
+        columns = int(text)
+    except ValueError as exc:
+        raise BackendError(
+            "APPLESCRIPT_ERROR", f"Не удалось определить число колонок таблицы на слайде {slide_num}: {text!r}"
+        ) from exc
+    if columns < FIXED_COLUMNS:
+        raise BackendError(
+            "TEMPLATE_INVALID",
+            f"В таблице на слайде {slide_num} колонок: {columns}, а нужно минимум {FIXED_COLUMNS} "
+            "(место, команда, итого) плюс колонки раундов. Проверьте выбранный слайд.",
+        )
+    return columns - FIXED_COLUMNS
+
+
+def read_rating_rounds(doc_name: str, slide_num: int) -> int:
+    """Сколько раундов должно быть записано: решает таблица Keynote на выбранном слайде."""
+    output = run_applescript(build_rating_columns_script(doc_name, slide_num))
+    return rounds_from_table_output(output, slide_num)
 
 
 def build_rating_script(teams: list[dict], slide_num: int, doc_name: str) -> str:

@@ -1,12 +1,31 @@
 """Общие помощники тестов. Секретов в репозитории нет: RSA-ключ генерируется на лету."""
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
 import tempfile
 
+import openpyxl
+
 TEST_EMAIL = "robot@test-project.iam.gserviceaccount.com"
+
+
+def workbook_bytes(rows: list, title: str = "Лист1", other_sheets: dict = None) -> bytes:
+    """Настоящий .xlsx в памяти: основной лист с названием title + дополнительные листы."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = title
+    for row in rows:
+        ws.append(row)
+    for name, other_rows in (other_sheets or {}).items():
+        other = wb.create_sheet(name)
+        for row in other_rows:
+            other.append(row)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
 
 _material_cache: dict = {}
 
