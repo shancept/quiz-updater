@@ -22,7 +22,8 @@ struct ContentView: View {
         }
         .task {
             await viewModel.refreshDocuments()
-            await viewModel.loadExcel()
+            await viewModel.refreshDriveStatus()
+            await viewModel.loadTeams()
         }
     }
 

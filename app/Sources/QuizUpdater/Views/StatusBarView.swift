@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 struct StatusBarView: View {
@@ -10,20 +9,10 @@ struct StatusBarView: View {
                 ProgressView().controlSize(.small)
             }
             if let status = viewModel.statusMessage {
-                Text(status.text)
-                    .foregroundStyle(status.isError ? .red : .primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                StatusMessageView(message: status)
             } else {
                 Text(" ")
-            }
-            Spacer()
-            if viewModel.statusMessage?.isAutomationDenied == true {
-                Button("Открыть настройки") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
+                Spacer()
             }
         }
         .padding(.horizontal, 12)

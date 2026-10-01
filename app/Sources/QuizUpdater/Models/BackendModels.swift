@@ -19,7 +19,46 @@ struct Team: Decodable, Identifiable, Hashable {
     let rounds: [Double?]
 }
 
-struct ReadExcelPayload: Decodable {
+/// Таблица результатов на Google Drive (Google Sheets или загруженный .xlsx).
+struct DriveSheet: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let mimeType: String
+    let modifiedTime: String?
+
+    var isGoogleSheet: Bool { mimeType == "application/vnd.google-apps.spreadsheet" }
+
+    /// modifiedTime приходит как ISO 8601 с долями секунды ("2026-09-30T18:00:00.000Z").
+    var modifiedDate: Date? {
+        guard let modifiedTime else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: modifiedTime) { return date }
+        return ISO8601DateFormatter().date(from: modifiedTime)
+    }
+}
+
+struct DriveStatusPayload: Decodable {
+    let connected: Bool
+    let clientEmail: String?
+}
+
+struct ConnectDrivePayload: Decodable {
+    let clientEmail: String
+    let sheetCount: Int
+}
+
+struct ListSheetsPayload: Decodable {
+    let clientEmail: String
+    let sheets: [DriveSheet]
+}
+
+struct ResolveLinkPayload: Decodable {
+    let sheet: DriveSheet
+}
+
+struct ReadSheetPayload: Decodable {
+    let sheetName: String
     let teams: [Team]
 }
 
@@ -39,6 +78,8 @@ struct UpdateRatingPayload: Decodable {
     let dryRun: Bool
     let doc: String
     let slide: Int
+    /// Сколько раундов записывается: решает таблица Keynote на слайде (колонки минус место/команда/итого).
+    let rounds: Int?
     let teams: [Team]?
     let updated: Int?
     let message: String?
@@ -106,11 +147,24 @@ struct BackendError: Error, LocalizedError, Identifiable {
     let id = UUID()
     let code: String
     let message: String
+    /// Адрес робота (сервисного аккаунта) — бэкенд присылает его с FILE_NOT_SHARED, чтобы показать «Скопировать».
+    let clientEmail: String?
+
+    init(code: String, message: String, clientEmail: String? = nil) {
+        self.code = code
+        self.message = message
+        self.clientEmail = clientEmail
+    }
 
     var errorDescription: String? { message }
 
     /// true для кода AUTOMATION_DENIED — UI показывает кнопку в Настройки.
     var isAutomationDenied: Bool { code == "AUTOMATION_DENIED" }
+
+    /// Drive не подключён или ключ непригоден — UI показывает кнопку «Подключить Google Drive…».
+    var needsDriveConnection: Bool {
+        ["DRIVE_NOT_CONNECTED", "DRIVE_KEY_INVALID", "DRIVE_AUTH_FAILED"].contains(code)
+    }
 }
 
 /// Минимальная форма ответа бэкенда, достаточная чтобы понять успех/ошибку
@@ -119,4 +173,5 @@ struct BackendEnvelopeCheck: Decodable {
     let ok: Bool
     let code: String?
     let error: String?
+    let clientEmail: String?
 }

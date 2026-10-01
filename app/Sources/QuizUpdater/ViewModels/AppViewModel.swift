@@ -24,7 +24,20 @@ struct StatusMessage: Identifiable {
     let id = UUID()
     let text: String
     let isError: Bool
-    let isAutomationDenied: Bool
+    var isAutomationDenied = false
+    /// Адрес робота — рядом с сообщением показывается кнопка «Скопировать».
+    var clientEmail: String?
+    /// Drive не подключён или ключ непригоден — рядом показывается «Подключить Google Drive…».
+    var needsDriveConnection = false
+}
+
+/// Состояние подключения к Google Drive на этом Mac.
+struct DriveConnection: Equatable {
+    var isConnected = false
+    /// Адрес робота (сервисного аккаунта), которому ведущий даёт доступ к папке с таблицами.
+    var clientEmail: String?
+    /// Сколько таблиц видит робот; известно после проверки доступа.
+    var sheetCount: Int?
 }
 
 @MainActor
@@ -32,8 +45,15 @@ final class AppViewModel: ObservableObject {
     @Published var documents: [KeynoteDocument] = []
     @Published var selectedDocument: KeynoteDocument?
 
-    @Published var excelPath: String
+    @Published var drive = DriveConnection()
+    @Published var selectedSheet: SelectedSheet?
     @Published var teams: [Team] = []
+
+    // Окно выбора таблицы
+    @Published var availableSheets: [DriveSheet] = []
+    @Published var isLoadingSheets = false
+    @Published var sheetListError: StatusMessage?
+    @Published var sheetLinkError: StatusMessage?
 
     @Published var previewState: PreviewState = .idle
     private var progressTask: Task<Void, Never>?
@@ -64,7 +84,7 @@ final class AppViewModel: ObservableObject {
     private let bridge = PythonBridge.shared
 
     init() {
-        self.excelPath = settings.excelPath
+        self.selectedSheet = settings.sheet
         self.maxRows = settings.maxRows
         self.ratingSlide = settings.ratingSlide ?? 81
     }
@@ -94,18 +114,97 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Excel
+    // MARK: - Google Drive
 
-    func loadExcel() async {
+    /// Подключён ли Drive на этом Mac (читает ключ с диска, без сети).
+    func refreshDriveStatus() async {
+        do {
+            let payload: DriveStatusPayload = try await bridge.run(["drive-status"])
+            drive.isConnected = payload.connected
+            drive.clientEmail = payload.clientEmail
+            if !payload.connected {
+                setStatus(
+                    "Google Drive не подключён. Нажмите «Подключить Google Drive…» и выберите JSON-ключ.",
+                    isError: true, needsDriveConnection: true
+                )
+            }
+        } catch {
+            reportBackendError(error)
+        }
+    }
+
+    /// Копирует ключ в ~/Library/Application Support/QuizUpdater и сразу проверяет доступ.
+    func connectDrive(keyURL: URL) async {
         isBusy = true
         defer { isBusy = false }
-        settings.excelPath = excelPath
         do {
-            let payload: ReadExcelPayload = try await bridge.run(["read-excel", "--path", excelPath])
-            teams = payload.teams
-            setStatus("Загружено команд: \(teams.count)", isError: false)
+            let payload: ConnectDrivePayload = try await bridge.run(
+                ["connect-drive", "--key", keyURL.path], timeout: 90
+            )
+            drive = DriveConnection(isConnected: true, clientEmail: payload.clientEmail, sheetCount: payload.sheetCount)
+            sheetListError = nil
+            sheetLinkError = nil
+            availableSheets = []
+            setStatus("Подключено, таблиц доступно: \(payload.sheetCount)", isError: false)
         } catch {
-            setStatus(error.localizedDescription, isError: true)
+            reportBackendError(error)
+        }
+    }
+
+    func loadSheets() async {
+        guard drive.isConnected else { return }
+        isLoadingSheets = true
+        sheetListError = nil
+        defer { isLoadingSheets = false }
+        do {
+            let payload: ListSheetsPayload = try await bridge.run(["list-sheets"], timeout: 90)
+            availableSheets = payload.sheets
+            drive.clientEmail = payload.clientEmail
+            drive.sheetCount = payload.sheets.count
+        } catch {
+            sheetListError = statusMessage(for: error)
+        }
+    }
+
+    func selectSheet(_ sheet: DriveSheet) async {
+        selectedSheet = SelectedSheet(id: sheet.id, name: sheet.name)
+        settings.sheet = selectedSheet
+        sheetLinkError = nil
+        await loadTeams()
+    }
+
+    /// Выбор по ссылке из браузера. Возвращает true, если таблица найдена и доступна роботу.
+    func selectSheet(fromLink link: String) async -> Bool {
+        isBusy = true
+        defer { isBusy = false }
+        sheetLinkError = nil
+        do {
+            let payload: ResolveLinkPayload = try await bridge.run(["resolve-link", "--link", link], timeout: 90)
+            await selectSheet(payload.sheet)
+            return true
+        } catch {
+            sheetLinkError = statusMessage(for: error)
+            return false
+        }
+    }
+
+    // MARK: - Команды из таблицы
+
+    /// Скачивает таблицу заново (без кэша) и обновляет список команд.
+    func loadTeams() async {
+        guard let sheet = selectedSheet else {
+            if drive.isConnected { setStatus("Выберите таблицу результатов", isError: false) }
+            return
+        }
+        guard drive.isConnected else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            let payload: ReadSheetPayload = try await bridge.run(["read-sheet", "--file-id", sheet.id], timeout: 90)
+            teams = payload.teams
+            setStatus("Загружено команд: \(teams.count) (\(payload.sheetName))", isError: false)
+        } catch {
+            reportBackendError(error)
         }
     }
 
@@ -161,20 +260,25 @@ final class AppViewModel: ObservableObject {
 
     func runRating(dryRun: Bool) async {
         guard let doc = selectedDocument, let slide = ratingSlide else { return }
+        guard let sheet = requireSheet() else { return }
         isBusy = true
         defer { isBusy = false }
         settings.maxRows = maxRows
 
         var args = [
             "update-rating", "--doc", doc.name, "--slide", String(slide),
-            "--excel", excelPath, "--max-rows", String(maxRows),
+            "--file-id", sheet.id, "--max-rows", String(maxRows),
         ]
         if dryRun { args.append("--dry-run") }
 
         do {
-            let payload: UpdateRatingPayload = try await bridge.run(args)
+            let payload: UpdateRatingPayload = try await bridge.run(args, timeout: 90)
             if dryRun {
-                setStatus("Проверка ок: слайд \(payload.slide), команд к обновлению: \(payload.teams?.count ?? 0)", isError: false)
+                let rounds = payload.rounds.map { ", раундов: \($0)" } ?? ""
+                setStatus(
+                    "Проверка ок: слайд \(payload.slide)\(rounds), команд к обновлению: \(payload.teams?.count ?? 0)",
+                    isError: false
+                )
             } else {
                 setStatus(payload.message ?? "Обновлено", isError: false)
             }
@@ -221,16 +325,17 @@ final class AppViewModel: ObservableObject {
 
     func runNames(dryRun: Bool) async {
         guard let doc = selectedDocument, !pairs.isEmpty else { return }
+        guard let sheet = requireSheet() else { return }
         isBusy = true
         defer { isBusy = false }
 
         var args = [
-            "replace-names", "--doc", doc.name, "--excel", excelPath, "--pairs", pairsArgument(),
+            "replace-names", "--doc", doc.name, "--file-id", sheet.id, "--pairs", pairsArgument(),
         ]
         if dryRun { args.append("--dry-run") }
 
         do {
-            let payload: ReplaceNamesPayload = try await bridge.run(args)
+            let payload: ReplaceNamesPayload = try await bridge.run(args, timeout: 90)
             placeholderFoundBySlide = Dictionary(
                 uniqueKeysWithValues: payload.assignments.map { ($0.slide, $0.placeholderFound ?? true) }
             )
@@ -312,15 +417,36 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - Статус
 
-    private func reportBackendError(_ error: Error) {
-        if let backendError = error as? BackendError {
-            setStatus(backendError.message, isError: true, isAutomationDenied: backendError.isAutomationDenied)
-        } else {
-            setStatus(error.localizedDescription, isError: true)
-        }
+    /// Таблица для действий с рейтингом/именами; если не выбрана — подсказка в статус-баре.
+    private func requireSheet() -> SelectedSheet? {
+        if let sheet = selectedSheet { return sheet }
+        setStatus("Выберите таблицу результатов (кнопка «Выбрать…» вверху)", isError: true)
+        return nil
     }
 
-    private func setStatus(_ text: String, isError: Bool, isAutomationDenied: Bool = false) {
-        statusMessage = StatusMessage(text: text, isError: isError, isAutomationDenied: isAutomationDenied)
+    private func statusMessage(for error: Error) -> StatusMessage {
+        if let backendError = error as? BackendError {
+            return StatusMessage(
+                text: backendError.message,
+                isError: true,
+                isAutomationDenied: backendError.isAutomationDenied,
+                clientEmail: backendError.clientEmail,
+                needsDriveConnection: backendError.needsDriveConnection
+            )
+        }
+        return StatusMessage(text: error.localizedDescription, isError: true)
+    }
+
+    private func reportBackendError(_ error: Error) {
+        statusMessage = self.statusMessage(for: error)
+    }
+
+    private func setStatus(
+        _ text: String, isError: Bool, isAutomationDenied: Bool = false, needsDriveConnection: Bool = false
+    ) {
+        statusMessage = StatusMessage(
+            text: text, isError: isError, isAutomationDenied: isAutomationDenied,
+            needsDriveConnection: needsDriveConnection
+        )
     }
 }
