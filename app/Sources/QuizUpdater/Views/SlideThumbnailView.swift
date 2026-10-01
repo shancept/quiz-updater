@@ -66,8 +66,13 @@ struct SlideThumbnailView: View {
 
     private var badgeText: String? {
         guard viewModel.mode == .names else { return nil }
-        guard let pair = viewModel.pairs.first(where: { $0.slide == slide.slide }) else { return nil }
-        return "\(pair.place) место"
+        if let pair = viewModel.pairs.first(where: { $0.slide == slide.slide }) {
+            return "\(pair.place) место"
+        }
+        if viewModel.templateSlide == slide.slide, !viewModel.extraTeams.isEmpty {
+            return "шаблон: \(viewModel.extraTeams.count) мест"
+        }
+        return nil
     }
 
     private var borderColor: Color {

@@ -7,6 +7,7 @@ import sys
 from . import drive as drive_mod
 from . import excel as excel_mod
 from . import keynote as keynote_mod
+from . import ordinals as ordinals_mod
 from . import schedule as schedule_mod
 from .applescript import run_applescript
 from .errors import BackendError
@@ -33,6 +34,24 @@ def parse_pairs(pairs_str: str) -> list:
             result.append((int(place_str), int(slide_str)))
         except ValueError as exc:
             raise BackendError("INVALID_ARGUMENT", f"Неверный формат пары: '{pair}'") from exc
+    return result
+
+
+def parse_places(places_str: str) -> list:
+    """Парсит строку 'место,место,...' (например '13,5,4') в список уникальных номеров мест."""
+    result = []
+    for part in places_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            place = int(part)
+        except ValueError as exc:
+            raise BackendError(
+                "INVALID_ARGUMENT", f"Неверный номер места: '{part}'. Ожидается список чисел, например '13,5,4'"
+            ) from exc
+        if place not in result:
+            result.append(place)
     return result
 
 
@@ -131,7 +150,16 @@ def cmd_replace_names(args: argparse.Namespace) -> dict:
     _, teams = download_teams(args.file_id, rounds=0)
     by_place = excel_mod.teams_by_place(teams)
     pairs = parse_pairs(args.pairs)
+    extra_places = parse_places(args.extra_places)
 
+    both = sorted({place for place, _ in pairs} & set(extra_places))
+    if both:
+        raise BackendError(
+            "INVALID_ARGUMENT",
+            f"Место {both[0]} указано и со своим слайдом (--pairs), и среди дополнительных (--extra-places)",
+        )
+
+    # Места с готовыми слайдами (1–3).
     assignments = []
     warnings = []
     for place, slide_num in pairs:
@@ -140,29 +168,73 @@ def cmd_replace_names(args: argparse.Namespace) -> dict:
             continue
         assignments.append((place, slide_num, by_place[place]))
 
-    if not assignments:
+    # Дополнительные места: слайды создаются из шаблона «НОМЕР МЕСТО»; показ — обратный отсчёт,
+    # от большего места к меньшему, поэтому и копии идут от большего.
+    extras = []
+    for place in sorted(extra_places, reverse=True):
+        if place not in by_place:
+            warnings.append(f"Место {place} не найдено в Excel")
+            continue
+        extras.append((place, ordinals_mod.ordinal_place(place).upper(), by_place[place]))
+
+    template_slide = args.template_slide
+    if extras and template_slide is None:
+        raise BackendError(
+            "INVALID_ARGUMENT",
+            "Для дополнительных мест нужен слайд-шаблон «НОМЕР МЕСТО» (--template-slide)",
+        )
+    action = None
+    if template_slide is not None:
+        found = keynote_mod.is_template(keynote_mod.read_slide_text_items(doc_name, template_slide))
+        action = keynote_mod.template_action(found, len(extras))
+        if action == "missing":
+            raise BackendError(
+                "TEMPLATE_INVALID",
+                f"На слайде {template_slide} нет текстов «{keynote_mod.NUMBER_PLACEHOLDER}» и "
+                f"«{keynote_mod.PLACEHOLDER}»: это не слайд-шаблон дополнительного места (или он уже "
+                "использован). Выберите слайд-шаблон.",
+            )
+
+    if not assignments and not extras:
         raise BackendError(
             "EXCEL_BAD_FORMAT",
             "; ".join(warnings) if warnings else "Нет данных для замены",
         )
 
+    copies = max(0, len(extras) - 1)
+    template_info = None if template_slide is None else {
+        "slide": template_slide, "found": action in ("use", "hide"), "action": action,
+    }
+    extras_dicts = [
+        {"place": p, "ordinal": o, "team": t, "action": "template" if i == len(extras) - 1 else "copy"}
+        for i, (p, o, t) in enumerate(extras)
+    ]
+
     if args.dry_run:
-        slide_nums = [a[1] for a in assignments]
-        found_map = keynote_mod.check_placeholders(doc_name, slide_nums)
+        found_map = keynote_mod.check_placeholders(doc_name, [a[1] for a in assignments]) if assignments else {}
         assignment_dicts = [
             {"place": p, "slide": s, "team": t, "placeholderFound": found_map.get(s, False)}
             for p, s, t in assignments
         ]
-        return {"dryRun": True, "doc": doc_name, "assignments": assignment_dicts, "warnings": warnings}
+        return {
+            "dryRun": True, "doc": doc_name, "assignments": assignment_dicts, "extras": extras_dicts,
+            "slidesToCreate": copies, "template": template_info, "warnings": warnings,
+        }
 
-    script = keynote_mod.build_names_script(assignments, doc_name)
+    template = None
+    if template_slide is not None and action in ("use", "hide"):
+        template = {"slide": template_slide, "extras": extras, "hide": action == "hide"}
+    script = keynote_mod.build_names_script(assignments, doc_name, template)
     message = run_applescript(script)
     assignment_dicts = [{"place": p, "slide": s, "team": t} for p, s, t in assignments]
     return {
         "dryRun": False,
         "doc": doc_name,
         "assignments": assignment_dicts,
-        "updated": len(assignments),
+        "extras": extras_dicts,
+        "template": template_info,
+        "created": copies,
+        "updated": len(assignments) + len(extras),
         "message": message,
         "warnings": warnings,
     }
@@ -260,7 +332,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_names = subparsers.add_parser("replace-names")
     p_names.add_argument("--doc", type=str, default=None)
     p_names.add_argument("--file-id", type=str, required=True, dest="file_id")
-    p_names.add_argument("--pairs", type=str, required=True, help="место:слайд,место:слайд, например 1:182,2:181")
+    p_names.add_argument("--pairs", type=str, default="", help="место:слайд,место:слайд, например 1:182,2:181")
+    p_names.add_argument("--extra-places", type=str, default="", dest="extra_places",
+                         help="дополнительные места, для которых слайды создаются из шаблона, например 13,5,4")
+    p_names.add_argument("--template-slide", type=int, default=None, dest="template_slide",
+                         help="слайд-шаблон «НОМЕР МЕСТО» (с текстами НОМЕР и ЗАМЕНИТЬ)")
     p_names.add_argument("--dry-run", action="store_true", dest="dry_run")
     p_names.set_defaults(handler=cmd_replace_names)
 

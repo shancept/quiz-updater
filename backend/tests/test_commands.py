@@ -313,26 +313,125 @@ class UpdateRatingTest(CommandTestCase):
         self.assertEqual((code, payload["code"]), (1, "TEMPLATE_INVALID"))
 
 
+SIX_TEAMS = workbook_bytes([HEADER] + [[i, f"Команда {i}", 100 - i] for i in range(1, 7)])
+TEMPLATE_ITEMS = [{"index": 1, "x": 1.0, "y": 1.0, "width": 1.0, "height": 1.0, "text": "ЗАМЕНИТЬ"},
+                  {"index": 2, "x": 1.0, "y": 2.0, "width": 1.0, "height": 1.0, "text": "НОМЕР"}]
+USED_ITEMS = [{"index": 1, "x": 1.0, "y": 1.0, "width": 1.0, "height": 1.0, "text": "ПЯТОЕ "},
+              {"index": 2, "x": 1.0, "y": 2.0, "width": 1.0, "height": 1.0, "text": "Команда 5"}]
+
+
 class ReplaceNamesTest(CommandTestCase):
     def setUp(self):
         super().setUp()
         self.install_key()
-        self.share_sheet()
+        self.share_sheet(content=SIX_TEAMS)
+        self.applescript = mock.Mock(return_value="OK")
+        self.slide_items = {189: TEMPLATE_ITEMS}
         for target, value in (
             ("resolve_doc_name", mock.Mock(return_value="Квиз")),
-            ("check_placeholders", mock.Mock(return_value={182: True, 181: False})),
+            ("check_placeholders", mock.Mock(return_value={192: True, 191: False})),
+            ("read_slide_text_items", mock.Mock(side_effect=lambda doc, slide: self.slide_items.get(slide, []))),
         ):
             patcher = mock.patch.object(cli.keynote_mod, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(cli, "run_applescript", self.applescript)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_names(self, *extra: str, dry: bool = True) -> tuple:
+        argv = ["replace-names", "--file-id", "sheet1", *extra] + (["--dry-run"] if dry else [])
+        return run_cli(*argv)
 
     def test_dry_run_matches_places_from_drive_to_slides(self):
-        code, payload = run_cli("replace-names", "--file-id", "sheet1", "--pairs", "1:182,2:181", "--dry-run")
+        code, payload = self.run_names("--pairs", "1:192,2:191")
         self.assertEqual(code, 0, payload)
         self.assertEqual(payload["assignments"], [
-            {"place": 1, "slide": 182, "team": "Альфа", "placeholderFound": True},
-            {"place": 2, "slide": 181, "team": "Бета", "placeholderFound": False},
+            {"place": 1, "slide": 192, "team": "Команда 1", "placeholderFound": True},
+            {"place": 2, "slide": 191, "team": "Команда 2", "placeholderFound": False},
         ])
+
+    def test_dry_run_plans_extra_places_countdown_with_template_last(self):
+        code, payload = self.run_names("--pairs", "1:192", "--extra-places", "4,6,5", "--template-slide", "189")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["extras"], [
+            {"place": 6, "ordinal": "ШЕСТОЕ", "team": "Команда 6", "action": "copy"},
+            {"place": 5, "ordinal": "ПЯТОЕ", "team": "Команда 5", "action": "copy"},
+            {"place": 4, "ordinal": "ЧЕТВЁРТОЕ", "team": "Команда 4", "action": "template"},
+        ])
+        self.assertEqual(payload["slidesToCreate"], 2)
+        self.assertEqual(payload["template"], {"slide": 189, "found": True, "action": "use"})
+        self.applescript.assert_not_called()
+
+    def test_single_extra_place_creates_no_new_slides(self):
+        _, payload = self.run_names("--extra-places", "5", "--template-slide", "189")
+        self.assertEqual(payload["slidesToCreate"], 0)
+        self.assertEqual(payload["extras"][0]["action"], "template")
+
+    def test_extras_only_without_pairs_is_allowed(self):
+        code, payload = self.run_names("--extra-places", "4,5", "--template-slide", "189")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["assignments"], [])
+
+    def test_real_run_duplicates_template_and_fills_all_extra_slides(self):
+        code, payload = self.run_names("--pairs", "1:192", "--extra-places", "4,6,5",
+                                       "--template-slide", "189", dry=False)
+        self.assertEqual(code, 0, payload)
+        script = self.applescript.call_args[0][0]
+        self.assertEqual(script.count("duplicate slide"), 2)
+        for word in ("ШЕСТОЕ", "ПЯТОЕ", "ЧЕТВЁРТОЕ"):
+            self.assertIn(f'"{word}"', script)
+        self.assertEqual((payload["updated"], payload["created"]), (4, 2))
+
+    def test_extra_places_need_a_template_slide(self):
+        code, payload = self.run_names("--extra-places", "4,5")
+        self.assertEqual((code, payload["code"]), (1, "INVALID_ARGUMENT"))
+        self.assertIn("шаблон", payload["error"])
+
+    def test_slide_without_number_placeholder_is_not_a_template(self):
+        self.slide_items[189] = USED_ITEMS
+        code, payload = self.run_names("--extra-places", "4,5", "--template-slide", "189")
+        self.assertEqual((code, payload["code"]), (1, "TEMPLATE_INVALID"))
+        self.assertIn("189", payload["error"])
+        self.assertIn("НОМЕР", payload["error"])
+
+    def test_place_cannot_be_both_fixed_and_extra(self):
+        code, payload = self.run_names("--pairs", "4:150", "--extra-places", "4", "--template-slide", "189")
+        self.assertEqual((code, payload["code"]), (1, "INVALID_ARGUMENT"))
+
+    def test_extra_place_missing_on_drive_is_a_warning(self):
+        _, payload = self.run_names("--pairs", "1:192", "--extra-places", "5,40", "--template-slide", "189")
+        self.assertEqual([e["place"] for e in payload["extras"]], [5])
+        self.assertTrue(any("40" in w for w in payload["warnings"]))
+
+    def test_nothing_to_replace_is_an_error(self):
+        code, payload = self.run_names("--extra-places", "40", "--template-slide", "189")
+        self.assertEqual((code, payload["code"]), (1, "EXCEL_BAD_FORMAT"))
+
+    def test_malformed_extra_places(self):
+        code, payload = self.run_names("--pairs", "1:192", "--extra-places", "четыре")
+        self.assertEqual((code, payload["code"]), (1, "INVALID_ARGUMENT"))
+
+    def test_unused_template_is_hidden_when_no_extra_places(self):
+        _, payload = self.run_names("--pairs", "1:192", "--template-slide", "189")
+        self.assertEqual(payload["template"], {"slide": 189, "found": True, "action": "hide"})
+        self.assertEqual((payload["extras"], payload["slidesToCreate"]), ([], 0))
+        self.share_sheet(content=SIX_TEAMS)  # ответы фейка отдаются по очереди — задаём заново
+        run_cli("replace-names", "--file-id", "sheet1", "--pairs", "1:192", "--template-slide", "189")
+        self.assertIn("set skipped of slide 189 to true", self.applescript.call_args[0][0])
+
+    def test_already_used_template_is_left_alone(self):
+        self.slide_items[189] = USED_ITEMS
+        _, payload = self.run_names("--pairs", "1:192", "--template-slide", "189")
+        self.assertEqual(payload["template"]["action"], "none")
+        self.share_sheet(content=SIX_TEAMS)
+        run_cli("replace-names", "--file-id", "sheet1", "--pairs", "1:192", "--template-slide", "189")
+        self.assertNotIn("skipped", self.applescript.call_args[0][0])
+
+    def test_without_template_slide_nothing_about_templates_is_reported(self):
+        _, payload = self.run_names("--pairs", "1:192")
+        self.assertIsNone(payload["template"])
+        self.assertEqual((payload["extras"], payload["slidesToCreate"]), ([], 0))
 
 
 class LocalModeRemovedTest(unittest.TestCase):

@@ -100,10 +100,33 @@ struct NameAssignment: Decodable, Identifiable, Hashable {
     let placeholderFound: Bool?
 }
 
+/// Дополнительное место (4+): слайд создаётся из слайда-шаблона «НОМЕР МЕСТО».
+struct ExtraPlace: Decodable, Identifiable, Hashable {
+    var id: Int { place }
+    let place: Int
+    /// «ТРИНАДЦАТОЕ» — как будет написано на слайде.
+    let ordinal: String
+    let team: String
+    /// copy — новая копия шаблона; template — сам шаблон достаётся самому младшему из дополнительных мест.
+    let action: String
+}
+
+/// Что будет со слайдом-шаблоном: use — используется, hide — скрывается из показа (мест нет),
+/// none — уже использован.
+struct TemplateInfo: Decodable, Hashable {
+    let slide: Int
+    let found: Bool
+    let action: String
+}
+
 struct ReplaceNamesPayload: Decodable {
     let dryRun: Bool
     let doc: String
     let assignments: [NameAssignment]
+    let extras: [ExtraPlace]?
+    let slidesToCreate: Int?
+    let created: Int?
+    let template: TemplateInfo?
     let updated: Int?
     let message: String?
     let warnings: [String]

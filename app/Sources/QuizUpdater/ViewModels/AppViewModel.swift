@@ -67,7 +67,11 @@ final class AppViewModel: ObservableObject {
     // Режим "Имена призёров"
     @Published var selectedPlaces: Set<Int> = []
     @Published var startSlide: Int?
+    /// Места 1–3 с готовыми слайдами (слайд определяется номером места).
     @Published var pairs: [PlaceSlidePair] = []
+    /// Слайд-шаблон «НОМЕР МЕСТО» для остальных мест; по умолчанию — слайд перед слайдом 3-го места.
+    @Published var templateSlide: Int?
+    private var templateSlideIsManual = false
     @Published var placeholderFoundBySlide: [Int: Bool] = [:]
 
     // Режим "Расписание игр"
@@ -317,14 +321,35 @@ final class AppViewModel: ObservableObject {
         recomputePairs()
     }
 
+    /// Места, у которых есть готовые слайды (1, 2, 3).
+    private static let fixedPlaces = 1...3
+
+    /// Дополнительные места (4+), по которым слайды создаются из шаблона; от большего к меньшему — так их показывают.
+    var extraTeams: [Team] {
+        teams
+            .filter { selectedPlaces.contains($0.place) && !Self.fixedPlaces.contains($0.place) }
+            .sorted { $0.place > $1.place }
+    }
+
+    var canRunNames: Bool {
+        guard startSlide != nil else { return false }
+        if pairs.isEmpty && extraTeams.isEmpty { return false }
+        return extraTeams.isEmpty || templateSlide != nil
+    }
+
     func recomputePairs() {
         guard let start = startSlide else {
             pairs = []
+            templateSlide = nil
             return
         }
-        let selected = teams.filter { selectedPlaces.contains($0.place) }.sorted { $0.place < $1.place }
-        pairs = selected.enumerated().map { index, team in
-            PlaceSlidePair(place: team.place, teamName: team.name, slide: start - index)
+        // Слайды мест 1–3 идут подряд: 1-е = стартовый, 2-е = перед ним, 3-е = ещё раньше (обратный отсчёт).
+        let selected = teams
+            .filter { selectedPlaces.contains($0.place) && Self.fixedPlaces.contains($0.place) }
+            .sorted { $0.place < $1.place }
+        pairs = selected.map { PlaceSlidePair(place: $0.place, teamName: $0.name, slide: start - ($0.place - 1)) }
+        if !templateSlideIsManual {
+            templateSlide = start - Self.fixedPlaces.count
         }
     }
 
@@ -333,39 +358,90 @@ final class AppViewModel: ObservableObject {
         pairs[index].slide = slide
     }
 
+    func updateTemplateSlide(_ slide: Int) {
+        templateSlide = slide
+        templateSlideIsManual = true
+    }
+
     private func pairsArgument() -> String {
         pairs.map { "\($0.place):\($0.slide)" }.joined(separator: ",")
     }
 
     func runNames(dryRun: Bool) async {
-        guard let doc = selectedDocument, !pairs.isEmpty else { return }
+        guard let doc = selectedDocument, canRunNames else { return }
         guard let sheet = requireSheet() else { return }
         isBusy = true
         defer { isBusy = false }
 
-        var args = [
-            "replace-names", "--doc", doc.name, "--file-id", sheet.id, "--pairs", pairsArgument(),
-        ]
+        var args = ["replace-names", "--doc", doc.name, "--file-id", sheet.id]
+        if !pairs.isEmpty { args += ["--pairs", pairsArgument()] }
+        let extras = extraTeams
+        if !extras.isEmpty { args += ["--extra-places", extras.map { String($0.place) }.joined(separator: ",")] }
+        // Шаблон передаём всегда, когда он известен: если дополнительных мест нет, бэкенд скроет его из показа.
+        if let templateSlide { args += ["--template-slide", String(templateSlide)] }
         if dryRun { args.append("--dry-run") }
 
         do {
-            let payload: ReplaceNamesPayload = try await bridge.run(args, timeout: 90)
-            placeholderFoundBySlide = Dictionary(
+            let payload: ReplaceNamesPayload = try await bridge.run(args, timeout: 120)
+            var found = Dictionary(
                 uniqueKeysWithValues: payload.assignments.map { ($0.slide, $0.placeholderFound ?? true) }
             )
+            if dryRun, let template = payload.template, template.action != "none" {
+                found[template.slide] = template.found
+            }
+            placeholderFoundBySlide = found
             if dryRun {
-                let missing = payload.assignments.filter { $0.placeholderFound == false }
-                if missing.isEmpty {
-                    setStatus("Проверка ок: плейсхолдер найден на всех \(payload.assignments.count) слайдах", isError: false)
-                } else {
-                    let slides = missing.map { String($0.slide) }.joined(separator: ", ")
-                    setStatus("Плейсхолдер «ЗАМЕНИТЬ» не найден на слайдах: \(slides)", isError: true)
-                }
+                let result = namesDryRunText(payload)
+                setStatus(result.text, isError: result.isError)
             } else {
                 setStatus(payload.message ?? "Обновлено", isError: false)
+                if (payload.created ?? 0) > 0 {
+                    await refreshAfterSlidesCreated(docName: doc.name)
+                }
             }
         } catch {
             reportBackendError(error)
+        }
+    }
+
+    /// «Проверить»: что будет сделано со слайдами мест, дополнительными местами и шаблоном.
+    private func namesDryRunText(_ payload: ReplaceNamesPayload) -> (text: String, isError: Bool) {
+        let missing = payload.assignments.filter { $0.placeholderFound == false }
+        if !missing.isEmpty {
+            let slides = missing.map { String($0.slide) }.joined(separator: ", ")
+            return ("Плейсхолдер «ЗАМЕНИТЬ» не найден на слайдах: \(slides)", true)
+        }
+        var parts: [String] = []
+        if !payload.assignments.isEmpty {
+            parts.append("«ЗАМЕНИТЬ» найден на всех \(payload.assignments.count) слайдах мест с готовыми слайдами")
+        }
+        if let extras = payload.extras, !extras.isEmpty {
+            let words = extras.map(\.ordinal).joined(separator: ", ")
+            let created = payload.slidesToCreate ?? 0
+            let template = payload.template.map { ", шаблон (слайд \($0.slide)) станет «\(extras.last?.ordinal ?? "")»" } ?? ""
+            parts.append("дополнительные места: \(words); новых слайдов: \(created)\(template)")
+        }
+        if let template = payload.template, template.action == "hide" {
+            parts.append("дополнительных мест нет — шаблон (слайд \(template.slide)) будет скрыт из показа")
+        }
+        let warnings = payload.warnings.map { "⚠️ \($0)" }
+        return (((["Проверка ок: " + parts.joined(separator: ". ")]) + warnings).joined(separator: "\n"), false)
+    }
+
+    /// После создания слайдов номера в документе сдвинулись: обновляем документ (и превью заново) и сбрасываем выбор слайдов.
+    private func refreshAfterSlidesCreated(docName: String) async {
+        startSlide = nil
+        templateSlide = nil
+        templateSlideIsManual = false
+        pairs = []
+        placeholderFoundBySlide = [:]
+        do {
+            let payload: ListDocumentsPayload = try await bridge.run(["list-documents"])
+            documents = payload.documents
+            // Смена selectedDocument (число слайдов другое) запускает перезагрузку превью в TopBarView.
+            selectedDocument = documents.first { $0.name == docName } ?? selectedDocument
+        } catch {
+            // Статус уже показан; превью обновятся по кнопке «Обновить превью».
         }
     }
 

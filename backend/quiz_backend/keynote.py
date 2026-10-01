@@ -7,8 +7,10 @@ import re
 from .applescript import escape_as_string, format_multiline_value, format_value, run_applescript
 from .errors import BackendError
 from .excel import FIXED_COLUMNS
+from .ordinals import ordinal_font_scale
 
 PLACEHOLDER = "ЗАМЕНИТЬ"
+NUMBER_PLACEHOLDER = "НОМЕР"
 SCHEDULE_SLOT_COUNT = 4
 NO_TABLE_MARKER = "no-table"
 
@@ -252,32 +254,104 @@ return "OK: обновлено {count} команд на слайде {slide_num
 """
 
 
-def build_names_script(assignments: list[tuple], doc_name: str) -> str:
-    """Генерирует AppleScript для замены плейсхолдера ЗАМЕНИТЬ именами команд.
+def _replace_placeholder_lines(slide_ref: str, placeholder: str, value: str, what: str, font_scale: float = 1.0) -> str:
+    """Фрагмент AppleScript: найти на слайде (переменная s) текст-плейсхолдер и заменить его на value.
 
-    assignments: список (place, slide_num, team_name).
+    Если плейсхолдера нет — ошибка с понятным текстом (what — где именно, для сообщения).
+    font_scale < 1 — после замены уменьшить размер шрифта этого поля (для длинных числительных).
     """
-    doc_ref = _doc_ref(doc_name)
-
-    replace_blocks = []
-    for place, slide_num, team_name in assignments:
-        escaped_name = escape_as_string(team_name)
-        replace_blocks.append(f"""
-        -- Место {place} → слайд {slide_num}
-        set s to slide {slide_num}
+    if font_scale < 1.0:
+        before = """
+                set baseSize to missing value
+                try
+                    set baseSize to size of object text of ti
+                end try"""
+        after = f"""
+                if baseSize is not missing value then set size of object text of ti to (baseSize * {font_scale:.4f})"""
+    else:
+        before = after = ""
+    return f"""
         set found to false
-        repeat with ti in text items of s
-            if object text of ti is "{PLACEHOLDER}" then
-                set object text of ti to "{escaped_name}"
+        repeat with ti in text items of {slide_ref}
+            if object text of ti is "{placeholder}" then{before}
+                set object text of ti to "{escape_as_string(value)}"{after}
                 set found to true
                 exit repeat
             end if
         end repeat
         if not found then
-            error "Не найден текст \\"{PLACEHOLDER}\\" на слайде {slide_num} (место {place})"
-        end if""")
+            error "Не найден текст \\"{placeholder}\\" {what}"
+        end if"""
+
+
+def template_placeholders(text_items: list[dict]) -> dict:
+    """Какие плейсхолдеры есть на слайде-шаблоне «НОМЕР МЕСТО»: {"number": bool, "name": bool}."""
+    texts = [t["text"] for t in text_items]
+    return {"number": NUMBER_PLACEHOLDER in texts, "name": PLACEHOLDER in texts}
+
+
+def is_template(text_items: list[dict]) -> bool:
+    """Слайд — неиспользованный шаблон дополнительного места: на нём и «НОМЕР», и «ЗАМЕНИТЬ»."""
+    found = template_placeholders(text_items)
+    return found["number"] and found["name"]
+
+
+def template_action(found: bool, extras_count: int) -> str:
+    """Что делать со слайдом-шаблоном.
+
+    use — взять под дополнительные места; hide — дополнительных мест нет, шаблон не нужен, скрыть из показа;
+    none — шаблон уже использован, не трогать; missing — дополнительные места есть, а шаблона нет (ошибка).
+    """
+    if extras_count > 0:
+        return "use" if found else "missing"
+    return "hide" if found else "none"
+
+
+def build_names_script(assignments: list[tuple], doc_name: str, template: dict = None) -> str:
+    """Генерирует AppleScript для замены плейсхолдеров именами команд.
+
+    assignments: список (place, slide_num, team_name) — места с готовыми слайдами (1–3).
+    template: дополнительные места из слайда-шаблона — {"slide": T, "extras": [(place, "ДЕВЯТОЕ", team), ...],
+    "hide": bool}. extras идут от большего места к меньшему — так их показывают (обратный отсчёт):
+    шаблон дублируется len(extras)-1 раз ПЕРЕД собой, копии занимают слайды T…, а сам шаблон
+    достаётся самому младшему из дополнительных мест. Все дубликаты делаются с нетронутого шаблона,
+    затем заполняются. Если extras пуст и hide=True — шаблон скрывается из показа.
+    """
+    doc_ref = _doc_ref(doc_name)
+    extras = template["extras"] if template else []
+    copies = max(0, len(extras) - 1)
+
+    replace_blocks = []
+    for place, slide_num, team_name in assignments:
+        replace_blocks.append(
+            f"        -- Место {place} → слайд {slide_num}\n        set s to slide {slide_num}"
+            + _replace_placeholder_lines("s", PLACEHOLDER, team_name, f"на слайде {slide_num} (место {place})")
+        )
+
+    if template and extras:
+        t = template["slide"]
+        lines = [f"        -- Дополнительные места: шаблон на слайде {t}, копий — {copies}"]
+        for i in range(copies):
+            lines.append(f"        duplicate slide {t + i} to before slide {t + i}")
+        for j, (place, ordinal, team_name) in enumerate(extras):
+            slide_num = t + j
+            lines.append(f"        -- Место {place} ({ordinal}) → слайд {slide_num}")
+            lines.append(f"        set s to slide {slide_num}")
+            lines.append(_replace_placeholder_lines(
+                "s", NUMBER_PLACEHOLDER, ordinal, f"на слайде {slide_num} (место {place})",
+                font_scale=ordinal_font_scale(ordinal)))
+            lines.append(_replace_placeholder_lines(
+                "s", PLACEHOLDER, team_name, f"на слайде {slide_num} (место {place})"))
+            lines.append("        set skipped of s to false")
+        replace_blocks.append("\n".join(lines))
+    elif template and template.get("hide"):
+        replace_blocks.append(
+            f"        -- Дополнительных мест нет: шаблон на слайде {template['slide']} скрываем из показа\n"
+            f"        set skipped of slide {template['slide']} to true"
+        )
 
     blocks = "\n".join(replace_blocks)
+    replaced = len(assignments) + len(extras)
 
     return f"""
 tell application "Keynote"
@@ -285,7 +359,7 @@ tell application "Keynote"
 {blocks}
     end tell
 end tell
-return "OK: обновлено {len(assignments)} слайдов"
+return "OK: заменено слайдов — {replaced}, создано новых — {copies}"
 """
 
 
