@@ -1,13 +1,19 @@
-PYTHON      ?= python3
 SYS_PYTHON  ?= /usr/bin/python3
 APP         := dist/QuizUpdater.app
-EXCEL       ?= ~/Library/CloudStorage/GoogleDrive-shancept@gmail.com/My Drive/КВИЗ/Копия Копия Калькулятор баллов Классика.xlsx
 
 .PHONY: vendor test-backend build app run clean
 
+# Зависимости ставятся ТЕМ ЖЕ интерпретатором, на котором бэкенд работает в бандле
+# (системный 3.9), чтобы pip выбрал версии, совместимые с ним. Только pure-Python
+# wheels: один набор файлов подходит и arm64, и x86_64.
 vendor:
 	rm -rf backend/vendor
-	$(PYTHON) -m pip install --target backend/vendor -r backend/requirements.txt --no-compile
+	$(SYS_PYTHON) -m pip install --target backend/vendor -r backend/requirements.txt \
+		--only-binary=:all: --no-compile --disable-pip-version-check
+	rm -rf backend/vendor/bin
+	@if find backend/vendor \( -name '*.so' -o -name '*.dylib' \) | grep -q .; then \
+		echo "ОШИБКА: в backend/vendor есть нативные библиотеки — бандл не будет universal"; exit 1; \
+	fi
 
 test-backend:
 	PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m quiz_backend list-documents
