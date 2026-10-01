@@ -25,8 +25,8 @@ struct DriveSettingsView: View {
                         HStack {
                             Text(email)
                                 .textSelection(.enabled)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 8)
                             CopyButton(text: email)
                         }
                         Text("В Google Drive откройте папку КВИЗ → «Поделиться» и дайте этому адресу доступ «Читатель». Таблицы игр должны лежать в этой папке.")

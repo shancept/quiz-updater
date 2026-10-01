@@ -102,7 +102,8 @@ struct SheetPickerView: View {
                 .fixedSize(horizontal: false, vertical: true)
             if let email = viewModel.drive.clientEmail {
                 HStack {
-                    Text(email).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                    Text(email).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
                     CopyButton(text: email)
                 }
             }

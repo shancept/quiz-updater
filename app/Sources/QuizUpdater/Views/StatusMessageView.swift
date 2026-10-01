@@ -10,7 +10,7 @@ struct StatusMessageView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(message.text)
                 .foregroundStyle(message.isError ? .red : .primary)
-                .lineLimit(3)
+                // Без lineLimit: в сообщении может быть адрес робота, его нельзя обрезать.
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             Spacer(minLength: 8)
