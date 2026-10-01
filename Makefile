@@ -1,5 +1,8 @@
 SYS_PYTHON  ?= /usr/bin/python3
 APP         := dist/QuizUpdater.app
+ARCHS       := arm64 x86_64
+MIN_MACOS   := 13.0
+UNIVERSAL   := app/.build/QuizUpdater-universal
 
 .PHONY: vendor test-backend build app run clean
 
@@ -25,14 +28,18 @@ test-backend:
 	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m quiz_backend drive-status
 	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=backend:backend/vendor $(SYS_PYTHON) -m quiz_backend list-documents
 
+# Universal-бинарь собирается по одной архитектуре (--triple) и склеивается lipo, а не одним
+# `swift build --arch arm64 --arch x86_64`: тот режим требует xcbuild из полного Xcode,
+# а так хватает одних Command Line Tools. Результат тот же: arm64 + x86_64.
 build:
-	swift build --package-path app -c release --arch arm64 --arch x86_64 --product QuizUpdater
+	$(foreach arch,$(ARCHS),swift build --package-path app -c release --triple $(arch)-apple-macosx$(MIN_MACOS) --product QuizUpdater &&) true
+	lipo -create $(foreach arch,$(ARCHS),app/.build/$(arch)-apple-macosx/release/QuizUpdater) -output $(UNIVERSAL)
 
 app: build vendor
 	rm -rf $(APP)
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources/backend"
 	cp app/Info.plist "$(APP)/Contents/Info.plist"
-	cp "$$(swift build --package-path app -c release --arch arm64 --arch x86_64 --product QuizUpdater --show-bin-path)/QuizUpdater" "$(APP)/Contents/MacOS/QuizUpdater"
+	cp $(UNIVERSAL) "$(APP)/Contents/MacOS/QuizUpdater"
 	rsync -a --exclude '__pycache__' backend/quiz_backend backend/vendor "$(APP)/Contents/Resources/backend/"
 	codesign --force --deep --sign - "$(APP)"
 	@echo "Собрано: $(APP)"

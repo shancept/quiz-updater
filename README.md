@@ -104,13 +104,13 @@ API для управления открытым документом — еди
 
 | Компонент | Технология | Почему |
 |---|---|---|
-| Интерфейс | Swift + SwiftUI, Swift Package Manager (без `.xcodeproj`) | нативный вид/ощущение Mac-приложения; SwiftPM собирает universal binary одной командой без танцев с Xcode-проектом |
+| Интерфейс | Swift + SwiftUI, Swift Package Manager (без `.xcodeproj`) | нативный вид/ощущение Mac-приложения; SwiftPM собирает universal binary без танцев с Xcode-проектом (хватает Command Line Tools) |
 | Автоматизация Keynote | AppleScript через `osascript` | единственный способ управлять уже открытым документом Keynote |
 | Источник таблицы | Google Drive API v3 через `urllib` + сервисный аккаунт (JWT RS256 подписывает `rsa`), scope `drive.readonly` | нужен доступ только на чтение; сервисному аккаунту не нужен токен пользователя, который протухает (у OAuth-приложения в режиме Testing refresh-токен живёт 7 дней) |
 | Разбор `.xlsx` | Python + `openpyxl` (из байтов, без файла на диске) | чистый Python, не требует компиляции под архитектуру — легко «вендорить» в бандл |
 | Связь Swift ↔ Python | `Process` (Foundation) + JSON по stdout/stdin | простой, отлаживаемый контракт: каждую команду бэкенда можно вручную запустить и проверить из терминала |
 | Превью слайдов | AppleScript-команда Keynote `export ... as slide images` → JPEG, кэш на диске | сам Keynote умеет рендерить слайды в картинки, велосипед не нужен |
-| Упаковка | Makefile: `swift build --arch arm64 --arch x86_64` + `codesign --sign -` (ad-hoc) | universal binary без Apple Developer-аккаунта — для личного использования на двух своих Mac этого достаточно |
+| Упаковка | Makefile: `swift build --triple` под каждую архитектуру + `lipo` + `codesign --sign -` (ad-hoc) | universal binary без Apple Developer-аккаунта — для личного использования на двух своих Mac этого достаточно |
 
 Целевая платформа — macOS 13 (Ventura) и новее, Intel и Apple Silicon
 (один и тот же файл `.app` работает на обоих благодаря universal binary).
@@ -313,9 +313,10 @@ export PYTHONPATH=backend:backend/vendor
 
 ## 6. Сборка
 
-Нужен полный Xcode (не только Command Line Tools) — для universal-сборки
-под arm64+x86_64, и системный `/usr/bin/python3` с `pip` (идёт с Command Line Tools) на машине,
-где собирается приложение. `make vendor` ставит им `openpyxl`, `rsa` и `pyasn1` в `backend/vendor/`
+Достаточно Xcode Command Line Tools (`xcode-select --install`), полный Xcode не нужен: с ними
+идут и Swift, и системный `/usr/bin/python3` с `pip`. Universal-бинарь собирается по одной
+архитектуре (`swift build --triple …`) и склеивается `lipo` — одна команда `--arch arm64 --arch x86_64`
+требовала бы `xcbuild` из полного Xcode. `make vendor` ставит им `openpyxl`, `rsa` и `pyasn1` в `backend/vendor/`
 — тем же интерпретатором, на котором бэкенд будет работать в бандле, поэтому pip выбирает версии,
 совместимые с Python 3.9. Ставятся только pure-Python wheels, и сборка падает, если в `backend/vendor/`
 попала нативная библиотека (иначе бандл перестал бы быть universal). Пользователю при использовании
