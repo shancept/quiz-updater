@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+backend/vendor/
+
+# Swift
+app/.build/
+
+# Build output
+dist/
+
+# JetBrains
+.idea/
