@@ -206,6 +206,7 @@ final class AppViewModel: ObservableObject {
         do {
             let payload: ReadSheetPayload = try await bridge.run(["read-sheet", "--file-id", sheet.id], timeout: 90)
             teams = payload.teams
+            recomputePairs()  // названия команд в уже выбранных местах тоже могли измениться
             setStatus("Загружено команд: \(teams.count) (\(payload.sheetName))", isError: false)
         } catch {
             reportBackendError(error)

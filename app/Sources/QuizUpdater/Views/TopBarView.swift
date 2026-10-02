@@ -38,6 +38,14 @@ struct TopBarView: View {
                         .frame(minWidth: 150, maxWidth: 240, alignment: .leading)
                         .help(viewModel.selectedSheet?.name ?? "Таблица не выбрана")
 
+                    Button {
+                        Task { await viewModel.loadTeams() }
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    .help("Перечитать таблицу с Google Drive (если результаты изменились)")
+                    .disabled(viewModel.selectedSheet == nil || viewModel.isBusy)
+
                     Button("Выбрать…") { isShowingSheetPicker = true }
 
                     Button {

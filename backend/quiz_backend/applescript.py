@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 
 from .errors import BackendError
@@ -28,6 +29,23 @@ def format_multiline_value(text: str) -> str:
     (буквальный '\\n' в AppleScript-литерале строкой не является — только именованные константы)."""
     lines = text.split("\n")
     return " & return & ".join(f'"{escape_as_string(line)}"' for line in lines)
+
+
+# «Не удается получить slide 193 of document …» (-1719): слайда с таким номером нет. Именно слайда: если
+# не нашлась таблица НА существующем слайде, сообщение начинается с «получить table 1 of slide …».
+_MISSING_SLIDE = re.compile(r"(?:получить|get) slide (\d+) of document")
+
+
+def slide_not_found_error(stderr: str) -> "BackendError | None":
+    """Понятная ошибка, если AppleScript упал из-за несуществующего слайда (документ изменился), иначе None."""
+    match = _MISSING_SLIDE.search(stderr)
+    if not match or "-1719" not in stderr:
+        return None
+    return BackendError(
+        "SLIDE_NOT_FOUND",
+        f"Слайда {match.group(1)} нет в документе — похоже, презентация изменилась. "
+        "Кликните по нужному слайду заново (и при необходимости обновите превью).",
+    )
 
 
 def run_applescript(script: str, timeout: int = 60) -> str:
@@ -59,6 +77,9 @@ def run_applescript(script: str, timeout: int = 60) -> str:
                 "Нет разрешения на управление Keynote. Разрешите доступ в Настройки → "
                 "Конфиденциальность и безопасность → Автоматизация.",
             )
+        missing_slide = slide_not_found_error(stderr)
+        if missing_slide:
+            raise missing_slide
         raise BackendError("APPLESCRIPT_ERROR", f"Ошибка AppleScript: {stderr}")
 
     return stdout.strip()
