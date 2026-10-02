@@ -24,7 +24,20 @@ struct StatusMessage: Identifiable {
     let id = UUID()
     let text: String
     let isError: Bool
-    let isAutomationDenied: Bool
+    var isAutomationDenied = false
+    /// Адрес робота — рядом с сообщением показывается кнопка «Скопировать».
+    var clientEmail: String?
+    /// Drive не подключён или ключ непригоден — рядом показывается «Подключить Google Drive…».
+    var needsDriveConnection = false
+}
+
+/// Состояние подключения к Google Drive на этом Mac.
+struct DriveConnection: Equatable {
+    var isConnected = false
+    /// Адрес робота (сервисного аккаунта), которому ведущий даёт доступ к папке с таблицами.
+    var clientEmail: String?
+    /// Сколько таблиц видит робот; известно после проверки доступа.
+    var sheetCount: Int?
 }
 
 @MainActor
@@ -32,8 +45,15 @@ final class AppViewModel: ObservableObject {
     @Published var documents: [KeynoteDocument] = []
     @Published var selectedDocument: KeynoteDocument?
 
-    @Published var excelPath: String
+    @Published var drive = DriveConnection()
+    @Published var selectedSheet: SelectedSheet?
     @Published var teams: [Team] = []
+
+    // Окно выбора таблицы
+    @Published var availableSheets: [DriveSheet] = []
+    @Published var isLoadingSheets = false
+    @Published var sheetListError: StatusMessage?
+    @Published var sheetLinkError: StatusMessage?
 
     @Published var previewState: PreviewState = .idle
     private var progressTask: Task<Void, Never>?
@@ -47,7 +67,11 @@ final class AppViewModel: ObservableObject {
     // Режим "Имена призёров"
     @Published var selectedPlaces: Set<Int> = []
     @Published var startSlide: Int?
+    /// Места 1–3 с готовыми слайдами (слайд определяется номером места).
     @Published var pairs: [PlaceSlidePair] = []
+    /// Слайд-шаблон «НОМЕР МЕСТО» для остальных мест; по умолчанию — слайд перед слайдом 3-го места.
+    @Published var templateSlide: Int?
+    private var templateSlideIsManual = false
     @Published var placeholderFoundBySlide: [Int: Bool] = [:]
 
     // Режим "Расписание игр"
@@ -64,7 +88,7 @@ final class AppViewModel: ObservableObject {
     private let bridge = PythonBridge.shared
 
     init() {
-        self.excelPath = settings.excelPath
+        self.selectedSheet = settings.sheet
         self.maxRows = settings.maxRows
         self.ratingSlide = settings.ratingSlide ?? 81
     }
@@ -94,18 +118,98 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Excel
+    // MARK: - Google Drive
 
-    func loadExcel() async {
+    /// Подключён ли Drive на этом Mac (читает ключ с диска, без сети).
+    func refreshDriveStatus() async {
+        do {
+            let payload: DriveStatusPayload = try await bridge.run(["drive-status"])
+            drive.isConnected = payload.connected
+            drive.clientEmail = payload.clientEmail
+            if !payload.connected {
+                setStatus(
+                    "Google Drive не подключён. Нажмите «Подключить Google Drive…» и выберите JSON-ключ.",
+                    isError: true, needsDriveConnection: true
+                )
+            }
+        } catch {
+            reportBackendError(error)
+        }
+    }
+
+    /// Копирует ключ в ~/Library/Application Support/QuizUpdater и сразу проверяет доступ.
+    func connectDrive(keyURL: URL) async {
         isBusy = true
         defer { isBusy = false }
-        settings.excelPath = excelPath
         do {
-            let payload: ReadExcelPayload = try await bridge.run(["read-excel", "--path", excelPath])
-            teams = payload.teams
-            setStatus("Загружено команд: \(teams.count)", isError: false)
+            let payload: ConnectDrivePayload = try await bridge.run(
+                ["connect-drive", "--key", keyURL.path], timeout: 90
+            )
+            drive = DriveConnection(isConnected: true, clientEmail: payload.clientEmail, sheetCount: payload.sheetCount)
+            sheetListError = nil
+            sheetLinkError = nil
+            availableSheets = []
+            setStatus("Подключено, таблиц доступно: \(payload.sheetCount)", isError: false)
         } catch {
-            setStatus(error.localizedDescription, isError: true)
+            reportBackendError(error)
+        }
+    }
+
+    func loadSheets() async {
+        guard drive.isConnected else { return }
+        isLoadingSheets = true
+        sheetListError = nil
+        defer { isLoadingSheets = false }
+        do {
+            let payload: ListSheetsPayload = try await bridge.run(["list-sheets"], timeout: 90)
+            availableSheets = payload.sheets
+            drive.clientEmail = payload.clientEmail
+            drive.sheetCount = payload.sheets.count
+        } catch {
+            sheetListError = statusMessage(for: error)
+        }
+    }
+
+    func selectSheet(_ sheet: DriveSheet) async {
+        selectedSheet = SelectedSheet(id: sheet.id, name: sheet.name)
+        settings.sheet = selectedSheet
+        sheetLinkError = nil
+        await loadTeams()
+    }
+
+    /// Выбор по ссылке из браузера. Возвращает true, если таблица найдена и доступна роботу.
+    func selectSheet(fromLink link: String) async -> Bool {
+        isBusy = true
+        defer { isBusy = false }
+        sheetLinkError = nil
+        do {
+            let payload: ResolveLinkPayload = try await bridge.run(["resolve-link", "--link", link], timeout: 90)
+            await selectSheet(payload.sheet)
+            return true
+        } catch {
+            sheetLinkError = statusMessage(for: error)
+            return false
+        }
+    }
+
+    // MARK: - Команды из таблицы
+
+    /// Скачивает таблицу заново (без кэша) и обновляет список команд.
+    func loadTeams() async {
+        guard let sheet = selectedSheet else {
+            if drive.isConnected { setStatus("Выберите таблицу результатов", isError: false) }
+            return
+        }
+        guard drive.isConnected else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            let payload: ReadSheetPayload = try await bridge.run(["read-sheet", "--file-id", sheet.id], timeout: 90)
+            teams = payload.teams
+            recomputePairs()  // названия команд в уже выбранных местах тоже могли измениться
+            setStatus("Загружено команд: \(teams.count) (\(payload.sheetName))", isError: false)
+        } catch {
+            reportBackendError(error)
         }
     }
 
@@ -161,26 +265,45 @@ final class AppViewModel: ObservableObject {
 
     func runRating(dryRun: Bool) async {
         guard let doc = selectedDocument, let slide = ratingSlide else { return }
+        guard let sheet = requireSheet() else { return }
         isBusy = true
         defer { isBusy = false }
         settings.maxRows = maxRows
 
         var args = [
             "update-rating", "--doc", doc.name, "--slide", String(slide),
-            "--excel", excelPath, "--max-rows", String(maxRows),
+            "--file-id", sheet.id, "--max-rows", String(maxRows),
         ]
         if dryRun { args.append("--dry-run") }
 
         do {
-            let payload: UpdateRatingPayload = try await bridge.run(args)
+            let payload: UpdateRatingPayload = try await bridge.run(args, timeout: 90)
             if dryRun {
-                setStatus("Проверка ок: слайд \(payload.slide), команд к обновлению: \(payload.teams?.count ?? 0)", isError: false)
+                let rounds = payload.rounds.map { ", раундов: \($0)" } ?? ""
+                var text = "Проверка ок: слайд \(payload.slide)\(rounds), команд: \(payload.teams?.count ?? 0)"
+                if let rows = ratingRowsText(payload) { text += "; \(rows)" }
+                setStatus(withWarnings(text, payload.warnings), isError: false)
             } else {
-                setStatus(payload.message ?? "Обновлено", isError: false)
+                setStatus(withWarnings(payload.message ?? "Обновлено", payload.warnings), isError: false)
             }
         } catch {
             reportBackendError(error)
         }
+    }
+
+    /// «строк в таблице Keynote: 10 → 8 (будет удалено 2)»; nil, если бэкенд не прислал число строк.
+    private func ratingRowsText(_ payload: UpdateRatingPayload) -> String? {
+        guard let current = payload.keynoteRows, let target = payload.targetRows else { return nil }
+        if current == target { return "строк в таблице: \(current)" }
+        let change = (payload.rowsAdded ?? 0) > 0
+            ? "будет добавлено \(payload.rowsAdded ?? 0)"
+            : "будет удалено \(payload.rowsRemoved ?? 0)"
+        return "строк в таблице Keynote: \(current) → \(target) (\(change))"
+    }
+
+    private func withWarnings(_ text: String, _ warnings: [String]?) -> String {
+        guard let warnings, !warnings.isEmpty else { return text }
+        return ([text] + warnings.map { "⚠️ \($0)" }).joined(separator: "\n")
     }
 
     // MARK: - Режим "Имена призёров"
@@ -199,14 +322,35 @@ final class AppViewModel: ObservableObject {
         recomputePairs()
     }
 
+    /// Места, у которых есть готовые слайды (1, 2, 3).
+    private static let fixedPlaces = 1...3
+
+    /// Дополнительные места (4+), по которым слайды создаются из шаблона; от большего к меньшему — так их показывают.
+    var extraTeams: [Team] {
+        teams
+            .filter { selectedPlaces.contains($0.place) && !Self.fixedPlaces.contains($0.place) }
+            .sorted { $0.place > $1.place }
+    }
+
+    var canRunNames: Bool {
+        guard startSlide != nil else { return false }
+        if pairs.isEmpty && extraTeams.isEmpty { return false }
+        return extraTeams.isEmpty || templateSlide != nil
+    }
+
     func recomputePairs() {
         guard let start = startSlide else {
             pairs = []
+            templateSlide = nil
             return
         }
-        let selected = teams.filter { selectedPlaces.contains($0.place) }.sorted { $0.place < $1.place }
-        pairs = selected.enumerated().map { index, team in
-            PlaceSlidePair(place: team.place, teamName: team.name, slide: start - index)
+        // Слайды мест 1–3 идут подряд: 1-е = стартовый, 2-е = перед ним, 3-е = ещё раньше (обратный отсчёт).
+        let selected = teams
+            .filter { selectedPlaces.contains($0.place) && Self.fixedPlaces.contains($0.place) }
+            .sorted { $0.place < $1.place }
+        pairs = selected.map { PlaceSlidePair(place: $0.place, teamName: $0.name, slide: start - ($0.place - 1)) }
+        if !templateSlideIsManual {
+            templateSlide = start - Self.fixedPlaces.count
         }
     }
 
@@ -215,38 +359,90 @@ final class AppViewModel: ObservableObject {
         pairs[index].slide = slide
     }
 
+    func updateTemplateSlide(_ slide: Int) {
+        templateSlide = slide
+        templateSlideIsManual = true
+    }
+
     private func pairsArgument() -> String {
         pairs.map { "\($0.place):\($0.slide)" }.joined(separator: ",")
     }
 
     func runNames(dryRun: Bool) async {
-        guard let doc = selectedDocument, !pairs.isEmpty else { return }
+        guard let doc = selectedDocument, canRunNames else { return }
+        guard let sheet = requireSheet() else { return }
         isBusy = true
         defer { isBusy = false }
 
-        var args = [
-            "replace-names", "--doc", doc.name, "--excel", excelPath, "--pairs", pairsArgument(),
-        ]
+        var args = ["replace-names", "--doc", doc.name, "--file-id", sheet.id]
+        if !pairs.isEmpty { args += ["--pairs", pairsArgument()] }
+        let extras = extraTeams
+        if !extras.isEmpty { args += ["--extra-places", extras.map { String($0.place) }.joined(separator: ",")] }
+        // Шаблон передаём всегда, когда он известен: если дополнительных мест нет, бэкенд скроет его из показа.
+        if let templateSlide { args += ["--template-slide", String(templateSlide)] }
         if dryRun { args.append("--dry-run") }
 
         do {
-            let payload: ReplaceNamesPayload = try await bridge.run(args)
-            placeholderFoundBySlide = Dictionary(
+            let payload: ReplaceNamesPayload = try await bridge.run(args, timeout: 120)
+            var found = Dictionary(
                 uniqueKeysWithValues: payload.assignments.map { ($0.slide, $0.placeholderFound ?? true) }
             )
+            if dryRun, let template = payload.template, template.action != "none" {
+                found[template.slide] = template.found
+            }
+            placeholderFoundBySlide = found
             if dryRun {
-                let missing = payload.assignments.filter { $0.placeholderFound == false }
-                if missing.isEmpty {
-                    setStatus("Проверка ок: плейсхолдер найден на всех \(payload.assignments.count) слайдах", isError: false)
-                } else {
-                    let slides = missing.map { String($0.slide) }.joined(separator: ", ")
-                    setStatus("Плейсхолдер «ЗАМЕНИТЬ» не найден на слайдах: \(slides)", isError: true)
-                }
+                let result = namesDryRunText(payload)
+                setStatus(result.text, isError: result.isError)
             } else {
                 setStatus(payload.message ?? "Обновлено", isError: false)
+                if (payload.created ?? 0) > 0 {
+                    await refreshAfterSlidesCreated(docName: doc.name)
+                }
             }
         } catch {
             reportBackendError(error)
+        }
+    }
+
+    /// «Проверить»: что будет сделано со слайдами мест, дополнительными местами и шаблоном.
+    private func namesDryRunText(_ payload: ReplaceNamesPayload) -> (text: String, isError: Bool) {
+        let missing = payload.assignments.filter { $0.placeholderFound == false }
+        if !missing.isEmpty {
+            let slides = missing.map { String($0.slide) }.joined(separator: ", ")
+            return ("Плейсхолдер «ЗАМЕНИТЬ» не найден на слайдах: \(slides)", true)
+        }
+        var parts: [String] = []
+        if !payload.assignments.isEmpty {
+            parts.append("«ЗАМЕНИТЬ» найден на всех \(payload.assignments.count) слайдах мест с готовыми слайдами")
+        }
+        if let extras = payload.extras, !extras.isEmpty {
+            let words = extras.map(\.ordinal).joined(separator: ", ")
+            let created = payload.slidesToCreate ?? 0
+            let template = payload.template.map { ", шаблон (слайд \($0.slide)) станет «\(extras.last?.ordinal ?? "")»" } ?? ""
+            parts.append("дополнительные места: \(words); новых слайдов: \(created)\(template)")
+        }
+        if let template = payload.template, template.action == "hide" {
+            parts.append("дополнительных мест нет — шаблон (слайд \(template.slide)) будет скрыт из показа")
+        }
+        let warnings = payload.warnings.map { "⚠️ \($0)" }
+        return (((["Проверка ок: " + parts.joined(separator: ". ")]) + warnings).joined(separator: "\n"), false)
+    }
+
+    /// После создания слайдов номера в документе сдвинулись: обновляем документ (и превью заново) и сбрасываем выбор слайдов.
+    private func refreshAfterSlidesCreated(docName: String) async {
+        startSlide = nil
+        templateSlide = nil
+        templateSlideIsManual = false
+        pairs = []
+        placeholderFoundBySlide = [:]
+        do {
+            let payload: ListDocumentsPayload = try await bridge.run(["list-documents"])
+            documents = payload.documents
+            // Смена selectedDocument (число слайдов другое) запускает перезагрузку превью в TopBarView.
+            selectedDocument = documents.first { $0.name == docName } ?? selectedDocument
+        } catch {
+            // Статус уже показан; превью обновятся по кнопке «Обновить превью».
         }
     }
 
@@ -312,15 +508,36 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - Статус
 
-    private func reportBackendError(_ error: Error) {
-        if let backendError = error as? BackendError {
-            setStatus(backendError.message, isError: true, isAutomationDenied: backendError.isAutomationDenied)
-        } else {
-            setStatus(error.localizedDescription, isError: true)
-        }
+    /// Таблица для действий с рейтингом/именами; если не выбрана — подсказка в статус-баре.
+    private func requireSheet() -> SelectedSheet? {
+        if let sheet = selectedSheet { return sheet }
+        setStatus("Выберите таблицу результатов (кнопка «Выбрать…» вверху)", isError: true)
+        return nil
     }
 
-    private func setStatus(_ text: String, isError: Bool, isAutomationDenied: Bool = false) {
-        statusMessage = StatusMessage(text: text, isError: isError, isAutomationDenied: isAutomationDenied)
+    private func statusMessage(for error: Error) -> StatusMessage {
+        if let backendError = error as? BackendError {
+            return StatusMessage(
+                text: backendError.message,
+                isError: true,
+                isAutomationDenied: backendError.isAutomationDenied,
+                clientEmail: backendError.clientEmail,
+                needsDriveConnection: backendError.needsDriveConnection
+            )
+        }
+        return StatusMessage(text: error.localizedDescription, isError: true)
+    }
+
+    private func reportBackendError(_ error: Error) {
+        statusMessage = self.statusMessage(for: error)
+    }
+
+    private func setStatus(
+        _ text: String, isError: Bool, isAutomationDenied: Bool = false, needsDriveConnection: Bool = false
+    ) {
+        statusMessage = StatusMessage(
+            text: text, isError: isError, isAutomationDenied: isAutomationDenied,
+            needsDriveConnection: needsDriveConnection
+        )
     }
 }

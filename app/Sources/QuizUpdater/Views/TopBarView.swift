@@ -1,9 +1,9 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct TopBarView: View {
     @EnvironmentObject private var viewModel: AppViewModel
-    @State private var isShowingExcelPicker = false
+    @State private var isShowingSheetPicker = false
+    @State private var isShowingDriveSettings = false
 
     var body: some View {
         HStack(spacing: 16) {
@@ -29,15 +29,31 @@ struct TopBarView: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Excel-файл").font(.caption).foregroundStyle(.secondary)
+                Text("Таблица результатов").font(.caption).foregroundStyle(.secondary)
                 HStack {
-                    Text((viewModel.excelPath as NSString).lastPathComponent)
+                    Text(viewModel.selectedSheet?.name ?? "Не выбрана")
+                        .foregroundStyle(viewModel.selectedSheet == nil ? .secondary : .primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                        .frame(minWidth: 200, maxWidth: 260, alignment: .leading)
-                        .help(viewModel.excelPath)
+                        .frame(minWidth: 150, maxWidth: 240, alignment: .leading)
+                        .help(viewModel.selectedSheet?.name ?? "Таблица не выбрана")
 
-                    Button("Выбрать…") { isShowingExcelPicker = true }
+                    Button {
+                        Task { await viewModel.loadTeams() }
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    .help("Перечитать таблицу с Google Drive (если результаты изменились)")
+                    .disabled(viewModel.selectedSheet == nil || viewModel.isBusy)
+
+                    Button("Выбрать…") { isShowingSheetPicker = true }
+
+                    Button {
+                        isShowingDriveSettings = true
+                    } label: {
+                        Image(systemName: viewModel.drive.isConnected ? "icloud" : "icloud.slash")
+                    }
+                    .help("Google Drive: подключение и адрес робота")
                 }
             }
 
@@ -50,16 +66,11 @@ struct TopBarView: View {
             }
             .disabled(viewModel.selectedDocument == nil || viewModel.isBusy)
         }
-        .fileImporter(
-            isPresented: $isShowingExcelPicker,
-            allowedContentTypes: [
-                UTType(filenameExtension: "xlsx") ?? .data
-            ]
-        ) { result in
-            if case .success(let url) = result {
-                viewModel.excelPath = url.path
-                Task { await viewModel.loadExcel() }
-            }
+        .sheet(isPresented: $isShowingSheetPicker) {
+            SheetPickerView().environmentObject(viewModel)
+        }
+        .sheet(isPresented: $isShowingDriveSettings) {
+            DriveSettingsView().environmentObject(viewModel)
         }
         .onChange(of: viewModel.selectedDocument) { _ in
             Task { await viewModel.loadPreviews() }

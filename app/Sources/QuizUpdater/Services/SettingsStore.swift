@@ -1,18 +1,40 @@
 import Foundation
 
-/// Хранилище пользовательских настроек в UserDefaults (путь к Excel, число команд, слайд рейтинга).
-struct SettingsStore {
-    static let defaultExcelPath = ("~/Library/CloudStorage/GoogleDrive-shancept@gmail.com/"
-        + "My Drive/КВИЗ/Копия Копия Калькулятор баллов Классика.xlsx" as NSString)
-        .expandingTildeInPath
+/// Таблица результатов, выбранная ведущим: ID файла на Google Drive и название для отображения.
+struct SelectedSheet: Hashable {
+    let id: String
+    let name: String
+}
 
-    private static let excelPathKey = "excelPath"
+/// Хранилище пользовательских настроек в UserDefaults (выбранная таблица, число команд, слайд рейтинга).
+struct SettingsStore {
+    private static let sheetIDKey = "sheetID"
+    private static let sheetNameKey = "sheetName"
     private static let maxRowsKey = "maxRows"
     private static let ratingSlideKey = "ratingSlide"
+    /// Ключ локального режима, который удалён: старое значение чистим, чтобы не висело в настройках.
+    private static let legacyExcelPathKey = "excelPath"
 
-    var excelPath: String {
-        get { UserDefaults.standard.string(forKey: Self.excelPathKey) ?? Self.defaultExcelPath }
-        set { UserDefaults.standard.set(newValue, forKey: Self.excelPathKey) }
+    init() {
+        UserDefaults.standard.removeObject(forKey: Self.legacyExcelPathKey)
+    }
+
+    /// Выбор действует, пока ведущий не выберет другую таблицу.
+    var sheet: SelectedSheet? {
+        get {
+            guard let id = UserDefaults.standard.string(forKey: Self.sheetIDKey), !id.isEmpty else { return nil }
+            let name = UserDefaults.standard.string(forKey: Self.sheetNameKey) ?? id
+            return SelectedSheet(id: id, name: name)
+        }
+        set {
+            if let newValue {
+                UserDefaults.standard.set(newValue.id, forKey: Self.sheetIDKey)
+                UserDefaults.standard.set(newValue.name, forKey: Self.sheetNameKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.sheetIDKey)
+                UserDefaults.standard.removeObject(forKey: Self.sheetNameKey)
+            }
+        }
     }
 
     var maxRows: Int {

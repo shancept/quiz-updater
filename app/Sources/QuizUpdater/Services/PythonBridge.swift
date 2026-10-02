@@ -134,7 +134,11 @@ final class PythonBridge {
             throw BridgeError.invalidOutput(raw)
         }
         if !check.ok {
-            throw BackendError(code: check.code ?? "UNKNOWN_ERROR", message: check.error ?? "Неизвестная ошибка бэкенда")
+            throw BackendError(
+                code: check.code ?? "UNKNOWN_ERROR",
+                message: check.error ?? "Неизвестная ошибка бэкенда",
+                clientEmail: check.clientEmail
+            )
         }
         return try decoder.decode(T.self, from: data)
     }

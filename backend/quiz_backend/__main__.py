@@ -2,19 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 
+from . import drive as drive_mod
 from . import excel as excel_mod
 from . import keynote as keynote_mod
+from . import ordinals as ordinals_mod
 from . import schedule as schedule_mod
 from .applescript import run_applescript
 from .errors import BackendError
 
-DEFAULT_EXCEL = os.path.expanduser(
-    "~/Library/CloudStorage/GoogleDrive-shancept@gmail.com/"
-    "My Drive/КВИЗ/Копия Копия Калькулятор баллов Классика.xlsx"
-)
 DEFAULT_SLIDE = 81
 DEFAULT_MAX_ROWS = 10
 DEFAULT_COMPRESSION = 0.5
@@ -40,15 +37,63 @@ def parse_pairs(pairs_str: str) -> list:
     return result
 
 
+def parse_places(places_str: str) -> list:
+    """Парсит строку 'место,место,...' (например '13,5,4') в список уникальных номеров мест."""
+    result = []
+    for part in places_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            place = int(part)
+        except ValueError as exc:
+            raise BackendError(
+                "INVALID_ARGUMENT", f"Неверный номер места: '{part}'. Ожидается список чисел, например '13,5,4'"
+            ) from exc
+        if place not in result:
+            result.append(place)
+    return result
+
+
 def cmd_list_documents(args: argparse.Namespace) -> dict:
     running = keynote_mod.is_keynote_running()
     documents = keynote_mod.list_documents() if running else []
     return {"keynoteRunning": running, "documents": documents}
 
 
-def cmd_read_excel(args: argparse.Namespace) -> dict:
-    teams = excel_mod.read_teams(args.path)
-    return {"teams": teams}
+def download_teams(file_id: str, rounds: int) -> tuple:
+    """Скачивает таблицу с Drive заново (без кэша) и читает команды → (метаданные файла, команды)."""
+    meta, data = drive_mod.installed_client().download_xlsx(file_id)
+    return meta, excel_mod.read_teams(data, rounds)
+
+
+def cmd_drive_status(args: argparse.Namespace) -> dict:
+    # Без сети: только читает адрес робота из ключа на диске.
+    if not drive_mod.is_connected():
+        return {"connected": False, "clientEmail": None}
+    return {"connected": True, "clientEmail": drive_mod.load_installed_key().client_email}
+
+
+def cmd_connect_drive(args: argparse.Namespace) -> dict:
+    key = drive_mod.read_key_file(args.key)
+    sheets = drive_mod.client_for(key).list_sheets()  # токен + запрос = проверка, что ключ рабочий
+    drive_mod.install_key(args.key)  # только после успешной проверки: рабочий ключ не затирается
+    return {"clientEmail": key.client_email, "sheetCount": len(sheets)}
+
+
+def cmd_list_sheets(args: argparse.Namespace) -> dict:
+    client = drive_mod.installed_client()
+    return {"clientEmail": client.client_email, "sheets": client.list_sheets()}
+
+
+def cmd_resolve_link(args: argparse.Namespace) -> dict:
+    file_id = drive_mod.parse_drive_link(args.link)
+    return {"sheet": drive_mod.installed_client().get_sheet(file_id)}
+
+
+def cmd_read_sheet(args: argparse.Namespace) -> dict:
+    meta, teams = download_teams(args.file_id, args.rounds)
+    return {"sheetName": meta["name"], "teams": teams}
 
 
 def cmd_export_previews(args: argparse.Namespace) -> dict:
@@ -59,29 +104,62 @@ def cmd_export_previews(args: argparse.Namespace) -> dict:
 
 def cmd_update_rating(args: argparse.Namespace) -> dict:
     doc_name = keynote_mod.resolve_doc_name(args.doc)
-    teams = excel_mod.read_teams(args.excel)
+    # Число раундов задаёт таблица Keynote на выбранном слайде, а не таблица на Drive.
+    table = keynote_mod.read_rating_table(doc_name, args.slide)
+    _, teams = download_teams(args.file_id, table["rounds"])
     teams = teams[: args.max_rows]
+    if not teams:
+        raise BackendError(
+            "EXCEL_BAD_FORMAT",
+            f"В таблице на Drive (лист «{excel_mod.SHEET_NAME}») не найдено ни одной команды: "
+            "данные должны идти со 2-й строки, место и название команды — в колонках A и B.",
+        )
+
+    # Число строк таблицы Keynote подгоняется под число команд: недостающие добавляются,
+    # лишние удаляются (иначе в них остались бы данные прошлой игры).
+    rows = keynote_mod.plan_row_change(table["rows"], len(teams), table["height"], table["font_size"])
+    rows_info = {
+        "keynoteRows": rows["currentRows"],
+        "targetRows": rows["targetRows"],
+        "rowsAdded": rows["added"],
+        "rowsRemoved": rows["removed"],
+        "warnings": rows["warnings"],
+    }
 
     if args.dry_run:
-        return {"dryRun": True, "doc": doc_name, "slide": args.slide, "teams": teams}
+        return {"dryRun": True, "doc": doc_name, "slide": args.slide, "rounds": table["rounds"],
+                "teams": teams, **rows_info}
 
     script = keynote_mod.build_rating_script(teams, args.slide, doc_name)
     message = run_applescript(script)
+    if rows["currentRows"] != rows["targetRows"]:
+        message += f" (строк в таблице: {rows['currentRows']} → {rows['targetRows']})"
     return {
         "dryRun": False,
         "doc": doc_name,
         "slide": args.slide,
+        "rounds": table["rounds"],
         "updated": len(teams),
         "message": message,
+        **rows_info,
     }
 
 
 def cmd_replace_names(args: argparse.Namespace) -> dict:
     doc_name = keynote_mod.resolve_doc_name(args.doc)
-    teams = excel_mod.read_teams(args.excel)
+    _, teams = download_teams(args.file_id, rounds=0)
     by_place = excel_mod.teams_by_place(teams)
     pairs = parse_pairs(args.pairs)
+    extra_places = parse_places(args.extra_places)
 
+    both = sorted({place for place, _ in pairs} & set(extra_places))
+    if both:
+        raise BackendError(
+            "INVALID_ARGUMENT",
+            f"Место {both[0]} указано и со своим слайдом (--pairs), и среди дополнительных (--extra-places)",
+        )
+
+    # Места с готовыми слайдами (1–3).
     assignments = []
     warnings = []
     for place, slide_num in pairs:
@@ -90,29 +168,73 @@ def cmd_replace_names(args: argparse.Namespace) -> dict:
             continue
         assignments.append((place, slide_num, by_place[place]))
 
-    if not assignments:
+    # Дополнительные места: слайды создаются из шаблона «НОМЕР МЕСТО»; показ — обратный отсчёт,
+    # от большего места к меньшему, поэтому и копии идут от большего.
+    extras = []
+    for place in sorted(extra_places, reverse=True):
+        if place not in by_place:
+            warnings.append(f"Место {place} не найдено в Excel")
+            continue
+        extras.append((place, ordinals_mod.ordinal_place(place).upper(), by_place[place]))
+
+    template_slide = args.template_slide
+    if extras and template_slide is None:
+        raise BackendError(
+            "INVALID_ARGUMENT",
+            "Для дополнительных мест нужен слайд-шаблон «НОМЕР МЕСТО» (--template-slide)",
+        )
+    action = None
+    if template_slide is not None:
+        found = keynote_mod.is_template(keynote_mod.read_slide_text_items(doc_name, template_slide))
+        action = keynote_mod.template_action(found, len(extras))
+        if action == "missing":
+            raise BackendError(
+                "TEMPLATE_INVALID",
+                f"На слайде {template_slide} нет текстов «{keynote_mod.NUMBER_PLACEHOLDER}» и "
+                f"«{keynote_mod.PLACEHOLDER}»: это не слайд-шаблон дополнительного места (или он уже "
+                "использован). Выберите слайд-шаблон.",
+            )
+
+    if not assignments and not extras:
         raise BackendError(
             "EXCEL_BAD_FORMAT",
             "; ".join(warnings) if warnings else "Нет данных для замены",
         )
 
+    copies = max(0, len(extras) - 1)
+    template_info = None if template_slide is None else {
+        "slide": template_slide, "found": action in ("use", "hide"), "action": action,
+    }
+    extras_dicts = [
+        {"place": p, "ordinal": o, "team": t, "action": "template" if i == len(extras) - 1 else "copy"}
+        for i, (p, o, t) in enumerate(extras)
+    ]
+
     if args.dry_run:
-        slide_nums = [a[1] for a in assignments]
-        found_map = keynote_mod.check_placeholders(doc_name, slide_nums)
+        found_map = keynote_mod.check_placeholders(doc_name, [a[1] for a in assignments]) if assignments else {}
         assignment_dicts = [
             {"place": p, "slide": s, "team": t, "placeholderFound": found_map.get(s, False)}
             for p, s, t in assignments
         ]
-        return {"dryRun": True, "doc": doc_name, "assignments": assignment_dicts, "warnings": warnings}
+        return {
+            "dryRun": True, "doc": doc_name, "assignments": assignment_dicts, "extras": extras_dicts,
+            "slidesToCreate": copies, "template": template_info, "warnings": warnings,
+        }
 
-    script = keynote_mod.build_names_script(assignments, doc_name)
+    template = None
+    if template_slide is not None and action in ("use", "hide"):
+        template = {"slide": template_slide, "extras": extras, "hide": action == "hide"}
+    script = keynote_mod.build_names_script(assignments, doc_name, template)
     message = run_applescript(script)
     assignment_dicts = [{"place": p, "slide": s, "team": t} for p, s, t in assignments]
     return {
         "dryRun": False,
         "doc": doc_name,
         "assignments": assignment_dicts,
-        "updated": len(assignments),
+        "extras": extras_dicts,
+        "template": template_info,
+        "created": copies,
+        "updated": len(assignments) + len(extras),
         "message": message,
         "warnings": warnings,
     }
@@ -174,9 +296,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = subparsers.add_parser("list-documents")
     p_list.set_defaults(handler=cmd_list_documents)
 
-    p_read = subparsers.add_parser("read-excel")
-    p_read.add_argument("--path", type=str, default=DEFAULT_EXCEL)
-    p_read.set_defaults(handler=cmd_read_excel)
+    p_status = subparsers.add_parser("drive-status")
+    p_status.set_defaults(handler=cmd_drive_status)
+
+    p_connect = subparsers.add_parser("connect-drive")
+    p_connect.add_argument("--key", type=str, required=True, help="путь к JSON-ключу сервисного аккаунта")
+    p_connect.set_defaults(handler=cmd_connect_drive)
+
+    p_sheets = subparsers.add_parser("list-sheets")
+    p_sheets.set_defaults(handler=cmd_list_sheets)
+
+    p_link = subparsers.add_parser("resolve-link")
+    p_link.add_argument("--link", type=str, required=True, help="ссылка на таблицу в Google Drive / Sheets")
+    p_link.set_defaults(handler=cmd_resolve_link)
+
+    p_read = subparsers.add_parser("read-sheet")
+    p_read.add_argument("--file-id", type=str, required=True, dest="file_id")
+    p_read.add_argument("--rounds", type=int, default=0, help="сколько колонок раундов (с D) прочитать")
+    p_read.set_defaults(handler=cmd_read_sheet)
 
     p_export = subparsers.add_parser("export-previews")
     p_export.add_argument("--doc", type=str, default=None)
@@ -187,15 +324,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_rating = subparsers.add_parser("update-rating")
     p_rating.add_argument("--doc", type=str, default=None)
     p_rating.add_argument("--slide", type=int, default=DEFAULT_SLIDE)
-    p_rating.add_argument("--excel", type=str, default=DEFAULT_EXCEL)
+    p_rating.add_argument("--file-id", type=str, required=True, dest="file_id")
     p_rating.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS, dest="max_rows")
     p_rating.add_argument("--dry-run", action="store_true", dest="dry_run")
     p_rating.set_defaults(handler=cmd_update_rating)
 
     p_names = subparsers.add_parser("replace-names")
     p_names.add_argument("--doc", type=str, default=None)
-    p_names.add_argument("--excel", type=str, default=DEFAULT_EXCEL)
-    p_names.add_argument("--pairs", type=str, required=True, help="место:слайд,место:слайд, например 1:182,2:181")
+    p_names.add_argument("--file-id", type=str, required=True, dest="file_id")
+    p_names.add_argument("--pairs", type=str, default="", help="место:слайд,место:слайд, например 1:182,2:181")
+    p_names.add_argument("--extra-places", type=str, default="", dest="extra_places",
+                         help="дополнительные места, для которых слайды создаются из шаблона, например 13,5,4")
+    p_names.add_argument("--template-slide", type=int, default=None, dest="template_slide",
+                         help="слайд-шаблон «НОМЕР МЕСТО» (с текстами НОМЕР и ЗАМЕНИТЬ)")
     p_names.add_argument("--dry-run", action="store_true", dest="dry_run")
     p_names.set_defaults(handler=cmd_replace_names)
 
@@ -221,7 +362,7 @@ def main() -> int:
         print(json.dumps({"ok": True, **payload}, ensure_ascii=False))
         return 0
     except BackendError as exc:
-        print(json.dumps({"ok": False, "code": exc.code, "error": exc.message}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "code": exc.code, "error": exc.message, **exc.details}, ensure_ascii=False))
         return 1
     except Exception as exc:  # noqa: BLE001 - всегда возвращаем валидный JSON наверх
         print(json.dumps({"ok": False, "code": "UNKNOWN_ERROR", "error": str(exc)}, ensure_ascii=False))

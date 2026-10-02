@@ -1,0 +1,461 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import stat
+import tempfile
+import unittest
+from unittest import mock
+
+from quiz_backend import __main__ as cli
+from quiz_backend import drive
+from quiz_backend.drive import SHEETS_MIME, XLSX_MIME
+
+from .fake_google import FakeGoogle, google_error
+from .helpers import TEST_EMAIL, service_account_json, workbook_bytes
+
+TOKEN_PATH = "/token"
+FILES = "/drive/v3/files"
+TOKEN_OK = (200, {"access_token": "ya29.test-token", "expires_in": 3600})
+
+SHEET = {"id": "sheet1", "name": "Классика #59 результаты", "mimeType": SHEETS_MIME,
+         "modifiedTime": "2026-09-30T18:00:00.000Z"}
+XLSX = {"id": "xlsx1", "name": "Старая.xlsx", "mimeType": XLSX_MIME, "modifiedTime": "2026-09-01T10:00:00.000Z"}
+DOC = {"id": "doc1", "name": "Заметки", "mimeType": "application/vnd.google-apps.document",
+       "modifiedTime": "2026-09-02T10:00:00.000Z"}
+
+HEADER = ["Место", "Команда", "Итого"] + [f"Раунд {i}" for i in range(1, 10)]
+# 9 колонок раундов на Drive: ровно сколько взять, решает Keynote.
+RESULTS = workbook_bytes([
+    HEADER,
+    [1, "Альфа", 90, 10, 20, 30, 40, 50, 60, 70, 80, 90],
+    [2, "Бета", 40, 1, 2, 3, 4, None, 6, 7, 8, 9],
+])
+
+
+def run_cli(*argv: str) -> tuple:
+    """Запускает main() как из терминала → (код выхода, распарсенный JSON из stdout)."""
+    out = io.StringIO()
+    with mock.patch("sys.argv", ["quiz_backend", *argv]), contextlib.redirect_stdout(out):
+        code = cli.main()
+    lines = out.getvalue().strip().splitlines()
+    assert len(lines) == 1, f"бэкенд должен печатать ровно один JSON-объект, а напечатал: {out.getvalue()!r}"
+    return code, json.loads(lines[0])
+
+
+class CommandTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.support_dir = os.path.join(tmp.name, "Support")
+
+        self.fake = FakeGoogle().start()
+        self.addCleanup(self.fake.stop)
+        self.fake.on("POST", TOKEN_PATH, TOKEN_OK)
+
+        for target, value in (
+            (drive, {"SUPPORT_DIR": self.support_dir,
+                     "API_BASE": self.fake.base_url + "/drive/v3",
+                     "TOKEN_URI": self.fake.base_url + TOKEN_PATH}),
+        ):
+            for name, val in value.items():
+                patcher = mock.patch.object(target, name, val)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+
+    def install_key(self, email: str = TEST_EMAIL) -> str:
+        path = os.path.join(self.tmp, "key-source.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(service_account_json(email=email), fh)
+        drive.install_key(path)
+        return path
+
+    def share_sheet(self, file_meta: dict = SHEET, content: bytes = RESULTS) -> None:
+        file_id = file_meta["id"]
+        self.fake.on("GET", f"{FILES}/{file_id}", (200, file_meta), (200, content))
+        self.fake.on("GET", f"{FILES}/{file_id}/export", (200, content))
+
+
+class DriveStatusTest(CommandTestCase):
+    def test_not_connected_is_not_an_error(self):
+        code, payload = run_cli("drive-status")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {"ok": True, "connected": False, "clientEmail": None})
+
+    def test_connected_reports_robot_address_without_network(self):
+        self.install_key()
+        code, payload = run_cli("drive-status")
+        self.assertEqual(payload, {"ok": True, "connected": True, "clientEmail": TEST_EMAIL})
+        self.assertEqual(self.fake.requests, [])
+
+
+class ConnectDriveTest(CommandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.key_file = os.path.join(self.tmp, "downloaded.json")
+        with open(self.key_file, "w", encoding="utf-8") as fh:
+            json.dump(service_account_json(), fh)
+
+    def test_verifies_access_then_installs_key(self):
+        self.fake.on("GET", FILES, (200, {"files": [SHEET, XLSX]}))
+        code, payload = run_cli("connect-drive", "--key", self.key_file)
+
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload, {"ok": True, "clientEmail": TEST_EMAIL, "sheetCount": 2})
+        self.assertEqual(stat.S_IMODE(os.stat(drive.key_path()).st_mode), 0o600)
+
+    def test_zero_sheets_is_still_connected(self):
+        self.fake.on("GET", FILES, (200, {"files": []}))
+        code, payload = run_cli("connect-drive", "--key", self.key_file)
+        self.assertEqual((code, payload["sheetCount"]), (0, 0))
+        self.assertTrue(drive.is_connected())
+
+    def test_rejected_key_is_not_installed(self):
+        self.fake.on("POST", TOKEN_PATH, (400, {"error": "invalid_grant", "error_description": "Invalid JWT Signature."}))
+        code, payload = run_cli("connect-drive", "--key", self.key_file)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["code"], "DRIVE_AUTH_FAILED")
+        self.assertFalse(drive.is_connected())
+
+    def test_failed_reconnect_keeps_previous_working_key(self):
+        self.install_key(email="old@test-project.iam.gserviceaccount.com")
+        self.fake.on("POST", TOKEN_PATH, (400, {"error": "invalid_grant", "error_description": "bad"}))
+        run_cli("connect-drive", "--key", self.key_file)
+        self.assertEqual(drive.load_installed_key().client_email, "old@test-project.iam.gserviceaccount.com")
+
+    def test_oauth_client_secret_file_is_rejected_without_network(self):
+        with open(self.key_file, "w", encoding="utf-8") as fh:
+            json.dump({"installed": {"client_id": "x"}}, fh)
+        code, payload = run_cli("connect-drive", "--key", self.key_file)
+        self.assertEqual((code, payload["code"]), (1, "DRIVE_KEY_INVALID"))
+        self.assertEqual(self.fake.requests, [])
+        self.assertFalse(drive.is_connected())
+
+
+class ListSheetsTest(CommandTestCase):
+    def test_lists_sheets_for_the_picker(self):
+        self.install_key()
+        self.fake.on("GET", FILES, (200, {"files": [SHEET, XLSX]}))
+        code, payload = run_cli("list-sheets")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["sheets"], [SHEET, XLSX])
+        self.assertEqual(payload["clientEmail"], TEST_EMAIL)
+
+    def test_without_key_says_drive_is_not_connected(self):
+        code, payload = run_cli("list-sheets")
+        self.assertEqual((code, payload["code"]), (1, "DRIVE_NOT_CONNECTED"))
+
+
+class ResolveLinkTest(CommandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.install_key()
+
+    def test_link_to_google_sheet_returns_its_metadata(self):
+        self.fake.on("GET", f"{FILES}/sheet1", (200, SHEET))
+        code, payload = run_cli("resolve-link", "--link", "https://docs.google.com/spreadsheets/d/sheet1/edit#gid=0")
+        self.assertEqual((code, payload["sheet"]), (0, SHEET))
+
+    def test_bad_link_is_rejected_without_network(self):
+        code, payload = run_cli("resolve-link", "--link", "привет")
+        self.assertEqual((code, payload["code"]), (1, "INVALID_LINK"))
+        self.assertEqual(self.fake.requests, [])
+
+    def test_link_to_unshared_file_asks_to_share_with_robot(self):
+        self.fake.on("GET", f"{FILES}/secret", google_error(404, "notFound"))
+        code, payload = run_cli("resolve-link", "--link", "https://docs.google.com/spreadsheets/d/secret/edit")
+        self.assertEqual((code, payload["code"]), (1, "FILE_NOT_SHARED"))
+        self.assertEqual(payload["clientEmail"], TEST_EMAIL)
+        self.assertIn(TEST_EMAIL, payload["error"])
+
+    def test_link_to_non_spreadsheet_is_rejected(self):
+        self.fake.on("GET", f"{FILES}/doc1", (200, DOC))
+        code, payload = run_cli("resolve-link", "--link", "https://docs.google.com/document/d/doc1/edit")
+        self.assertEqual((code, payload["code"]), (1, "EXCEL_BAD_FORMAT"))
+
+
+class ReadSheetTest(CommandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.install_key()
+
+    def test_reads_teams_from_google_sheet(self):
+        self.share_sheet()
+        code, payload = run_cli("read-sheet", "--file-id", "sheet1", "--rounds", "2")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["sheetName"], SHEET["name"])
+        self.assertEqual(payload["teams"][0], {"place": 1, "name": "Альфа", "total": 90, "rounds": [10, 20]})
+
+    def test_reads_teams_from_uploaded_xlsx(self):
+        self.share_sheet(XLSX)
+        code, payload = run_cli("read-sheet", "--file-id", "xlsx1")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual([t["name"] for t in payload["teams"]], ["Альфа", "Бета"])
+
+    def test_every_call_downloads_fresh_data(self):
+        self.share_sheet()
+        _, first = run_cli("read-sheet", "--file-id", "sheet1")
+        self.share_sheet(content=workbook_bytes([HEADER, [1, "Гамма", 99]]))
+        _, second = run_cli("read-sheet", "--file-id", "sheet1")
+        self.assertEqual(first["teams"][0]["name"], "Альфа")
+        self.assertEqual(second["teams"][0]["name"], "Гамма")
+
+    def test_not_shared_file(self):
+        self.fake.on("GET", f"{FILES}/sheet1", google_error(404, "notFound"))
+        code, payload = run_cli("read-sheet", "--file-id", "sheet1")
+        self.assertEqual((code, payload["code"], payload["clientEmail"]), (1, "FILE_NOT_SHARED", TEST_EMAIL))
+
+    def test_missing_sheet1_lists_sheets(self):
+        self.share_sheet(content=workbook_bytes([HEADER], title="Результаты"))
+        code, payload = run_cli("read-sheet", "--file-id", "sheet1")
+        self.assertEqual((code, payload["code"]), (1, "EXCEL_BAD_FORMAT"))
+        self.assertIn("Результаты", payload["error"])
+
+
+def table_shape(rows: int = 10, columns: int = 11, height: float = 568.0, font_size: float = 22.0) -> dict:
+    """Что бэкенд узнаёт о таблице Keynote на слайде (вместо настоящего Keynote)."""
+    return {"rows": rows, "columns": columns, "height": height, "font_size": font_size, "rounds": columns - 3}
+
+
+class UpdateRatingTest(CommandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.install_key()
+        self.share_sheet()
+        self.applescript = mock.Mock(return_value="OK")
+        self.table = mock.Mock(return_value=table_shape())
+        for target, value in (
+            ("resolve_doc_name", mock.Mock(return_value="Квиз")),
+            ("read_rating_table", self.table),
+        ):
+            patcher = mock.patch.object(cli.keynote_mod, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(cli, "run_applescript", self.applescript)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def dry_run(self, *extra: str) -> tuple:
+        return run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", "--dry-run", *extra)
+
+    def test_dry_run_takes_exactly_as_many_rounds_as_keynote_table_has(self):
+        code, payload = self.dry_run("--max-rows", "3")
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["dryRun"])
+        self.assertEqual(payload["rounds"], 8)
+        self.assertEqual(payload["teams"][0]["rounds"], [10, 20, 30, 40, 50, 60, 70, 80])
+        self.assertEqual(payload["teams"][1]["rounds"], [1, 2, 3, 4, None, 6, 7, 8])  # пустая ячейка → пустая
+        self.applescript.assert_not_called()
+
+    def test_seven_round_table_gets_seven_rounds(self):
+        self.table.return_value = table_shape(columns=10)
+        _, payload = self.dry_run()
+        self.assertEqual(payload["rounds"], 7)
+        self.assertEqual(payload["teams"][0]["rounds"], [10, 20, 30, 40, 50, 60, 70])
+
+    def test_dry_run_reports_rows_to_remove_when_keynote_table_is_longer(self):
+        self.table.return_value = table_shape(rows=10)  # на Drive две команды
+        _, payload = self.dry_run()
+        self.assertEqual(
+            (payload["keynoteRows"], payload["targetRows"], payload["rowsAdded"], payload["rowsRemoved"]),
+            (10, 2, 0, 8),
+        )
+        self.assertEqual(payload["warnings"], [])
+
+    def test_dry_run_reports_rows_to_add_when_keynote_table_is_shorter(self):
+        self.table.return_value = table_shape(rows=1)
+        _, payload = self.dry_run()
+        self.assertEqual((payload["rowsAdded"], payload["rowsRemoved"]), (1, 0))
+
+    def test_dry_run_warns_when_added_rows_will_not_fit_the_font(self):
+        self.table.return_value = table_shape(rows=1, height=40.0, font_size=22.0)  # 2 строки по 20 pt при шрифте 22 pt
+        _, payload = self.dry_run()
+        self.assertEqual(len(payload["warnings"]), 1)
+
+    def test_max_rows_limits_teams_and_target_rows(self):
+        _, payload = self.dry_run("--max-rows", "1")
+        self.assertEqual([t["name"] for t in payload["teams"]], ["Альфа"])
+        self.assertEqual((payload["targetRows"], payload["rowsRemoved"]), (1, 9))
+
+    def test_real_run_writes_eight_rounds_and_resizes_the_table(self):
+        code, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1")
+        self.assertEqual(code, 0, payload)
+        script = self.applescript.call_args[0][0]
+        self.assertIn("set value of cell 11 of row 1 of t to 80", script)
+        self.assertNotIn("cell 12", script)
+        self.assertIn("set row count of t to 2", script)
+        self.assertEqual((payload["keynoteRows"], payload["targetRows"], payload["rowsRemoved"]), (10, 2, 8))
+
+    def test_real_run_message_mentions_row_change(self):
+        _, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1")
+        self.assertIn("10 → 2", payload["message"])
+
+    def test_real_run_message_is_plain_when_row_count_already_matches(self):
+        self.table.return_value = table_shape(rows=2)
+        _, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1")
+        self.assertNotIn("→", payload["message"])
+
+    def test_empty_results_sheet_is_an_error_not_an_empty_table(self):
+        for extra in (["--dry-run"], []):
+            self.share_sheet(content=workbook_bytes([HEADER]))  # ответы фейка отдаются по очереди — задаём заново
+            code, payload = run_cli("update-rating", "--slide", "81", "--file-id", "sheet1", *extra)
+            self.assertEqual((code, payload["code"]), (1, "EXCEL_BAD_FORMAT"), extra)
+            self.assertIn("команд", payload["error"])
+        self.applescript.assert_not_called()
+
+    def test_keynote_error_is_reported_before_touching_drive_data(self):
+        from quiz_backend.errors import BackendError
+        self.table.side_effect = BackendError("TEMPLATE_INVALID", "нет таблицы")
+        code, payload = self.dry_run()
+        self.assertEqual((code, payload["code"]), (1, "TEMPLATE_INVALID"))
+
+
+SIX_TEAMS = workbook_bytes([HEADER] + [[i, f"Команда {i}", 100 - i] for i in range(1, 7)])
+TEMPLATE_ITEMS = [{"index": 1, "x": 1.0, "y": 1.0, "width": 1.0, "height": 1.0, "text": "ЗАМЕНИТЬ"},
+                  {"index": 2, "x": 1.0, "y": 2.0, "width": 1.0, "height": 1.0, "text": "НОМЕР"}]
+USED_ITEMS = [{"index": 1, "x": 1.0, "y": 1.0, "width": 1.0, "height": 1.0, "text": "ПЯТОЕ "},
+              {"index": 2, "x": 1.0, "y": 2.0, "width": 1.0, "height": 1.0, "text": "Команда 5"}]
+
+
+class ReplaceNamesTest(CommandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.install_key()
+        self.share_sheet(content=SIX_TEAMS)
+        self.applescript = mock.Mock(return_value="OK")
+        self.slide_items = {189: TEMPLATE_ITEMS}
+        for target, value in (
+            ("resolve_doc_name", mock.Mock(return_value="Квиз")),
+            ("check_placeholders", mock.Mock(return_value={192: True, 191: False})),
+            ("read_slide_text_items", mock.Mock(side_effect=lambda doc, slide: self.slide_items.get(slide, []))),
+        ):
+            patcher = mock.patch.object(cli.keynote_mod, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(cli, "run_applescript", self.applescript)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_names(self, *extra: str, dry: bool = True) -> tuple:
+        argv = ["replace-names", "--file-id", "sheet1", *extra] + (["--dry-run"] if dry else [])
+        return run_cli(*argv)
+
+    def test_dry_run_matches_places_from_drive_to_slides(self):
+        code, payload = self.run_names("--pairs", "1:192,2:191")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["assignments"], [
+            {"place": 1, "slide": 192, "team": "Команда 1", "placeholderFound": True},
+            {"place": 2, "slide": 191, "team": "Команда 2", "placeholderFound": False},
+        ])
+
+    def test_dry_run_plans_extra_places_countdown_with_template_last(self):
+        code, payload = self.run_names("--pairs", "1:192", "--extra-places", "4,6,5", "--template-slide", "189")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["extras"], [
+            {"place": 6, "ordinal": "ШЕСТОЕ", "team": "Команда 6", "action": "copy"},
+            {"place": 5, "ordinal": "ПЯТОЕ", "team": "Команда 5", "action": "copy"},
+            {"place": 4, "ordinal": "ЧЕТВЁРТОЕ", "team": "Команда 4", "action": "template"},
+        ])
+        self.assertEqual(payload["slidesToCreate"], 2)
+        self.assertEqual(payload["template"], {"slide": 189, "found": True, "action": "use"})
+        self.applescript.assert_not_called()
+
+    def test_single_extra_place_creates_no_new_slides(self):
+        _, payload = self.run_names("--extra-places", "5", "--template-slide", "189")
+        self.assertEqual(payload["slidesToCreate"], 0)
+        self.assertEqual(payload["extras"][0]["action"], "template")
+
+    def test_extras_only_without_pairs_is_allowed(self):
+        code, payload = self.run_names("--extra-places", "4,5", "--template-slide", "189")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["assignments"], [])
+
+    def test_real_run_duplicates_template_and_fills_all_extra_slides(self):
+        code, payload = self.run_names("--pairs", "1:192", "--extra-places", "4,6,5",
+                                       "--template-slide", "189", dry=False)
+        self.assertEqual(code, 0, payload)
+        script = self.applescript.call_args[0][0]
+        self.assertEqual(script.count("duplicate slide"), 2)
+        for word in ("ШЕСТОЕ", "ПЯТОЕ", "ЧЕТВЁРТОЕ"):
+            self.assertIn(f'"{word}"', script)
+        self.assertEqual((payload["updated"], payload["created"]), (4, 2))
+
+    def test_extra_places_need_a_template_slide(self):
+        code, payload = self.run_names("--extra-places", "4,5")
+        self.assertEqual((code, payload["code"]), (1, "INVALID_ARGUMENT"))
+        self.assertIn("шаблон", payload["error"])
+
+    def test_slide_without_number_placeholder_is_not_a_template(self):
+        self.slide_items[189] = USED_ITEMS
+        code, payload = self.run_names("--extra-places", "4,5", "--template-slide", "189")
+        self.assertEqual((code, payload["code"]), (1, "TEMPLATE_INVALID"))
+        self.assertIn("189", payload["error"])
+        self.assertIn("НОМЕР", payload["error"])
+
+    def test_place_cannot_be_both_fixed_and_extra(self):
+        code, payload = self.run_names("--pairs", "4:150", "--extra-places", "4", "--template-slide", "189")
+        self.assertEqual((code, payload["code"]), (1, "INVALID_ARGUMENT"))
+
+    def test_extra_place_missing_on_drive_is_a_warning(self):
+        _, payload = self.run_names("--pairs", "1:192", "--extra-places", "5,40", "--template-slide", "189")
+        self.assertEqual([e["place"] for e in payload["extras"]], [5])
+        self.assertTrue(any("40" in w for w in payload["warnings"]))
+
+    def test_nothing_to_replace_is_an_error(self):
+        code, payload = self.run_names("--extra-places", "40", "--template-slide", "189")
+        self.assertEqual((code, payload["code"]), (1, "EXCEL_BAD_FORMAT"))
+
+    def test_malformed_extra_places(self):
+        code, payload = self.run_names("--pairs", "1:192", "--extra-places", "четыре")
+        self.assertEqual((code, payload["code"]), (1, "INVALID_ARGUMENT"))
+
+    def test_unused_template_is_hidden_when_no_extra_places(self):
+        _, payload = self.run_names("--pairs", "1:192", "--template-slide", "189")
+        self.assertEqual(payload["template"], {"slide": 189, "found": True, "action": "hide"})
+        self.assertEqual((payload["extras"], payload["slidesToCreate"]), ([], 0))
+        self.share_sheet(content=SIX_TEAMS)  # ответы фейка отдаются по очереди — задаём заново
+        run_cli("replace-names", "--file-id", "sheet1", "--pairs", "1:192", "--template-slide", "189")
+        self.assertIn("set skipped of slide 189 to true", self.applescript.call_args[0][0])
+
+    def test_already_used_template_is_left_alone(self):
+        self.slide_items[189] = USED_ITEMS
+        _, payload = self.run_names("--pairs", "1:192", "--template-slide", "189")
+        self.assertEqual(payload["template"]["action"], "none")
+        self.share_sheet(content=SIX_TEAMS)
+        run_cli("replace-names", "--file-id", "sheet1", "--pairs", "1:192", "--template-slide", "189")
+        self.assertNotIn("skipped", self.applescript.call_args[0][0])
+
+    def test_without_template_slide_nothing_about_templates_is_reported(self):
+        _, payload = self.run_names("--pairs", "1:192")
+        self.assertIsNone(payload["template"])
+        self.assertEqual((payload["extras"], payload["slidesToCreate"]), ([], 0))
+
+
+class LocalModeRemovedTest(unittest.TestCase):
+    def _rejects(self, *argv: str) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(list(argv))
+
+    def test_read_excel_subcommand_is_gone(self):
+        self._rejects("read-excel")
+
+    def test_excel_option_is_gone_from_update_rating(self):
+        self._rejects("update-rating", "--excel", "/tmp/x.xlsx", "--file-id", "a")
+
+    def test_excel_option_is_gone_from_replace_names(self):
+        self._rejects("replace-names", "--excel", "/tmp/x.xlsx", "--file-id", "a", "--pairs", "1:2")
+
+    def test_no_default_excel_path(self):
+        self.assertFalse(hasattr(cli, "DEFAULT_EXCEL"))
+
+    def test_file_id_is_required(self):
+        self._rejects("update-rating", "--slide", "81")
+        self._rejects("replace-names", "--pairs", "1:2")
+        self._rejects("read-sheet")
+
+
+if __name__ == "__main__":
+    unittest.main()
