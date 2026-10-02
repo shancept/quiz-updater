@@ -121,6 +121,7 @@ API для управления открытым документом — еди
 quiz/
 ├── Makefile                     — все команды сборки (vendor/build/app/run/clean/test-backend)
 ├── README.md                    — этот файл
+├── docs/INSTALL.md              — установка на другой Mac (человеком или Claude Code) и выпуск релиза
 ├── update_keynote_rating.py     — исходный CLI-скрипт (оставлен для справки/истории)
 ├── update_keynote_names.py      — исходный CLI-скрипт (оставлен для справки/истории)
 ├── backend/
@@ -385,31 +386,24 @@ QUIZ_BACKEND_DIR="$(pwd)/backend" swift run --package-path app
 терминал, а не `QuizUpdater.app` — финальную проверку разрешений делайте
 через `open dist/QuizUpdater.app`.
 
-## 7. Перенос на другой Mac (в т.ч. Intel)
+## 7. Установка на другой Mac (в т.ч. Intel)
 
-**Вариант 1 — собрать на месте (надёжнее всего):**
-```bash
-# скопировать репозиторий на целевой Mac любым способом, затем:
-make app && make run
-```
+Пошаговая инструкция — **[`docs/INSTALL.md`](docs/INSTALL.md)**. Она написана так, чтобы по ней мог работать
+Claude Code прямо на целевом Mac («установи QuizUpdater по docs/INSTALL.md»): с проверкой каждого шага,
+командами и разделением на то, что делает Claude, и то, что должен сделать человек (перенести ключ, нажать
+«Разрешить» для Keynote).
 
-**Вариант 2 — перенести уже собранный `.app`:**
-- через scp/USB/локальную сеть — работает сразу;
-- через AirDrop/скачивание из интернета — macOS помечает файл атрибутом
-  quarantine, Gatekeeper заблокирует запуск ad-hoc-подписанного
-  приложения. Снять карантин на целевом Mac:
-  ```bash
-  xattr -dr com.apple.quarantine /Applications/QuizUpdater.app
-  ```
-
-На целевом Mac должен быть Python 3 (для запуска уже собранного
-бэкенда) — проще всего через Command Line Tools:
-```bash
-xcode-select -p || xcode-select --install
-```
-Устанавливать Python-зависимости на целевой машине не нужно — они уже внутри `.app`.
-Ключ Google вместе с `.app` не переезжает: на каждом Mac один раз нужно нажать
-«Подключить Google Drive…» (раздел 8).
+Коротко:
+- **Из готового релиза** (GitHub Releases, файл `QuizUpdater-universal.zip` — универсальное приложение
+  для Intel и Apple Silicon): скачать, распаковать в `/Applications`, снять карантин
+  `xattr -dr com.apple.quarantine /Applications/QuizUpdater.app` (приложение подписано без Apple-аккаунта и не
+  нотаризовано, поэтому Gatekeeper иначе заблокирует запуск).
+- **Из исходников** (если релиза нет): `git clone … && make app` — нужны только Command Line Tools.
+- На целевом Mac нужны macOS 13+ и Command Line Tools (`xcode-select --install`): из них берётся системный
+  `/usr/bin/python3` 3.9, на котором работает бэкенд. Python-зависимости устанавливать не нужно — они внутри `.app`.
+- **Ключ Google вместе с `.app` не переезжает** и в GitHub не выкладывается никогда: его переносят отдельно
+  (AirDrop, флешка, менеджер паролей) и один раз подключают («Подключить Google Drive…» или
+  `quiz_backend connect-drive --key …`, раздел 8).
 
 ## 8. Подключение Google Drive (один раз)
 
