@@ -34,19 +34,27 @@ struct RatingModeView: View {
             }
             .frame(minHeight: 200)
 
-            HStack {
-                Button("Проверить") {
-                    Task { await viewModel.runRating(dryRun: true) }
-                }
-                .disabled(viewModel.ratingSlide == nil || viewModel.isBusy)
-
-                Button("Обновить таблицу") {
-                    Task { await viewModel.runRating(dryRun: false) }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(viewModel.ratingSlide == nil || viewModel.isBusy)
+            // Подпись длинная: в узкой панели кнопки встают друг под друга, а не режут текст.
+            ViewThatFits(in: .horizontal) {
+                HStack { checkButton; updateButton }
+                VStack(alignment: .leading) { checkButton; updateButton }
             }
         }
+    }
+
+    private var checkButton: some View {
+        Button("Проверить") {
+            Task { await viewModel.runRating(dryRun: true) }
+        }
+        .disabled(viewModel.ratingSlide == nil || viewModel.isBusy)
+    }
+
+    private var updateButton: some View {
+        Button("Обновить таблицу в презентации") {
+            Task { await viewModel.runRating(dryRun: false) }
+        }
+        .keyboardShortcut(.defaultAction)
+        .disabled(viewModel.ratingSlide == nil || viewModel.isBusy)
     }
 
     private func formatValue(_ value: Double?) -> String {
